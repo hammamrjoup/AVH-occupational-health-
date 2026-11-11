@@ -1,0 +1,31 @@
+﻿[2026-11-03 17:11:12] === Watchdog Service Started (Port 8085) ===
+[2026-11-03 17:11:24] Starting serve.ps1 in background...
+[2026-11-03 17:11:28] Server auto-recovery SUCCESSFUL. Portal online at http://localhost:8085/api/health
+[2026-11-03 17:12:59] Server health check failed (1/2)
+[2026-11-03 17:13:06] Server health check failed (2/2)
+[2026-11-03 17:13:06] Server unresponsive. Triggering auto-recovery...
+[2026-11-03 17:13:07] Starting serve.ps1 in background...
+[2026-11-03 17:13:10] Server auto-recovery SUCCESSFUL. Portal online at http://localhost:8085/api/health
+[2026-11-04 09:05:35] Server health check failed (1/2)
+[2026-11-04 09:07:05] Server health check failed (1/2)
+[2026-11-04 09:10:14] Server health check failed (1/2)
+[2026-11-04 09:11:35] Server health check failed (1/2)
+[2026-11-04 10:19:48] Server health check failed (1/2)
+[2026-11-04 11:15:57] Server health check failed (1/2)
+[2026-11-04 11:43:56] Server health check failed (1/2)
+[2026-11-04 11:50:59] Server health check failed (1/2)
+[2026-11-04 13:17:48] Server health check failed (1/2)
+[2026-11-08 15:23:16] === Watchdog Service Started (Port 8085) ===
+[2026-11-08 17:55:15] === Watchdog Service Started (Port 8085) ===
+[2026-11-08 17:55:22] Server health check failed (1/2)
+[2026-11-08 17:57:06] Server health check failed (1/2)
+[2026-11-08 18:04:47] Server health check failed (1/2)
+[2026-11-08 18:04:58] Server health check failed (1/2)
+[2026-11-08 18:08:08] Server health check failed (1/2)
+[2026-11-08 19:14:54] === Watchdog Service Started (Port 8085) ===
+[2026-11-08 19:15:52] Server health check failed (1/3)
+[2026-11-08 19:19:31] Server health check failed (1/3)
+[2026-11-09 09:12:10] === Watchdog Service Started (Port 8085) ===
+[2026-11-10 09:46:14] === Watchdog Service Started (Port 8085) ===
+[2026-11-10 18:25:36] === Watchdog Service Started (Port 8085) ===
+[2026-11-11 22:15:27] === Watchdog Service Started (Port 8085) ===

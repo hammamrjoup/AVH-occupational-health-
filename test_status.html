@@ -1,0 +1,126 @@
+<!DOCTYPE html>
+<html>
+<head>
+<script src="js/data.js"></script>
+<script src="js/reports.js"></script>
+</head>
+<body>
+<div id="out"></div>
+<script>
+window.addEventListener('DOMContentLoaded', () => {
+    const g = {
+    "id":  "1503",
+    "empNo":  "1503",
+    "idNo":  "409601960",
+    "name":  "George Jawad Elias Al Bandak",
+    "department":  "Employees in oncology, hematooncology",
+    "jobTitle":  "Pathology Laboratory Technologist",
+    "dob":  "06/11/2003",
+    "staffGroup":  "Extended Program",
+    "hepbTiter":  "229.2",
+    "hbsabDate":  "19/10/2026",
+    "immunityStatus":  "Fully Immune",
+    "invasiveProcedure":  "No",
+    "demographic":  {
+                        "personNumber":  "1503",
+                        "nationalId":  "409601960",
+                        "fullName":  "George Jawad Elias Al Bandak",
+                        "arabicFullName":  "???? ???? ????? ??????",
+                        "dob":  "06/11/2003",
+                        "age":  "23",
+                        "gender":  "Male",
+                        "idType":  "West Bank Id",
+                        "orgName":  "Anatomical Pathology Department/Tech",
+                        "positionName":  "Pathology Laboratory Technologist",
+                        "positionArabic":  "??? ????? ??? ???????",
+                        "startDate":  "19/10/2026",
+                        "assignmentEffectiveDate":  "19/10/2026",
+                        "staffGroup":  "Extended Program",
+                        "deptTreating":  "Employees in oncology, hematooncology",
+                        "department":  "Employees in oncology, hematooncology",
+                        "invasiveProcedure":  "No"
+                    },
+    "healthStatus":  {
+                         "allergies":  "None",
+                         "pregnancyStatus":  "Not Pregnant / N/A"
+                     },
+    "labResults":  {
+                       "hbsabResult":  "229.2",
+                       "hbsabDate":  "19/10/2026",
+                       "engrixDose1":  "",
+                       "engrixDose2":  "",
+                       "engrixDose3":  "",
+                       "engrixBooster":  "",
+                       "hcvResult":  "Negative",
+                       "hcvDate":  "19/10/2026",
+                       "hivResult":  "Negative",
+                       "hivDate":  "19/10/2026",
+                       "ppdStep1Result":  "Negative",
+                       "ppdStep1Induration":  "0 mm",
+                       "ppdStep1Date":  "19/10/2026",
+                       "ppdStep2Result":  "Negative",
+                       "ppdStep2Induration":  "0 mm",
+                       "ppdStep2Date":  "19/10/2026",
+                       "varicellaIgG":  "",
+                       "varicellaIgGDate":  "",
+                       "note":  ""
+                   },
+    "vaccines":  {
+                     "ipvDate":  "21/10/2026",
+                     "tdapDate":  "21/10/2026",
+                     "mmrDose1":  "child hood",
+                     "mmrDose2":  "21/10/2026",
+                     "chickenpoxStatus":  "Natural Immunity",
+                     "chickenpoxDose1":  "",
+                     "chickenpoxDose2":  "",
+                     "varicellaIgG":  "",
+                     "varicellaIgGDate":  ""
+                 },
+    "specialVaccines":  {
+                            "meningococcal":  "",
+                            "hepA1":  "",
+                            "hepA2":  "",
+                            "typhoid":  "",
+                            "pneumovax":  ""
+                        },
+    "covidFlu":  {
+                     "covidDose1Date":  "",
+                     "covidDose1Batch":  "",
+                     "covidDose2Date":  "",
+                     "covidDose2Batch":  "",
+                     "covidDose3Date":  "",
+                     "covidDose3Batch":  "",
+                     "flu2324":  "",
+                     "flu2425":  ""
+                 },
+    "pep":  {
+                "additionalPepRecords":  {
+
+                                         }
+            },
+    "preVaccinationChecklist":  {
+                                    "q3":  "N/A",
+                                    "q4":  "N/A"
+                                },
+    "checklist":  {
+                      "q3":  "N/A",
+                      "q4":  "N/A"
+                  },
+    "_version":  7,
+    "_serverUpdatedAt":  "2026-10-24T14:04:50.4776275+03:00"
+};
+    const status = calculateMOHImmunityStatus(g);
+    const rowVals = extractRowColumnValues(g);
+    document.getElementById('out').innerText = JSON.stringify({
+        status: status,
+        g_immunityStatus: g.immunityStatus,
+        row_immunityStatus: rowVals.immunityStatus,
+        row_ipv: rowVals.ipv,
+        row_tdap: rowVals.tdap,
+        row_mmr1: rowVals.mmr1,
+        row_chickenpox: rowVals.chickenpox
+    });
+});
+</script>
+</body>
+</html>

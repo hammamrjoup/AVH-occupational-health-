@@ -1,0 +1,2053 @@
+﻿param(
+    [switch]$AllowNetworkAccess = $false,
+    [int]$Port = 8085,
+    [switch]$Https = $false,
+    [int]$HttpsPort = 8443,
+    [string]$OwnerAccount = "hammam"
+)
+
+$listener = New-Object System.Net.HttpListener
+
+# Bind localhost by default (Secure Local-Only Binding)
+$listener.Prefixes.Add("http://localhost:$Port/")
+$listener.Prefixes.Add("http://127.0.0.1:$Port/")
+
+if ($Https) {
+    try {
+        $listener.Prefixes.Add("https://localhost:$HttpsPort/")
+        $listener.Prefixes.Add("https://127.0.0.1:$HttpsPort/")
+    } catch {
+        Write-Warning "Could not bind HTTPS prefixes: $($_.Exception.Message)"
+    }
+}
+
+$ipAddresses = @()
+$networkBound = $false
+try {
+    $ipAddresses = @(Get-NetIPAddress -AddressFamily IPv4 -Type Unicast -ErrorAction SilentlyContinue | Where-Object { $_.IPAddress -ne '127.0.0.1' -and -not $_.IPAddress.StartsWith('169.254.') } | Select-Object -ExpandProperty IPAddress)
+} catch {}
+if (-not $ipAddresses -or $ipAddresses.Count -eq 0) {
+    try {
+        $ipAddresses = @([System.Net.Dns]::GetHostAddresses([System.Net.Dns]::GetHostName()) | Where-Object { $_.AddressFamily -eq 'InterNetwork' -and $_.IPAddressToString -ne '127.0.0.1' -and -not $_.IPAddressToString.StartsWith('169.254.') } | ForEach-Object { $_.IPAddressToString })
+    } catch {}
+}
+
+if ($AllowNetworkAccess) {
+    try {
+        $listener.Prefixes.Add("http://+:$Port/")
+        if ($Https) {
+            $listener.Prefixes.Add("https://+:$HttpsPort/")
+        }
+        $listener.Start()
+        $networkBound = $true
+    } catch {
+        foreach ($ip in $ipAddresses) {
+            try {
+                $listener.Prefixes.Add("http://" + $ip + ":$Port/")
+            } catch {}
+        }
+        try {
+            $listener.Start()
+            $networkBound = $true
+        } catch {
+            Write-Host " [!] Network binding requires URL reservation or Administrator rights." -ForegroundColor Yellow
+            Write-Host "     Falling back to secure localhost only..." -ForegroundColor Gray
+            $listener = New-Object System.Net.HttpListener
+            $listener.Prefixes.Add("http://localhost:$Port/")
+            $listener.Prefixes.Add("http://127.0.0.1:$Port/")
+            $listener.Start()
+            $networkBound = $false
+        }
+    }
+} else {
+    try {
+        $listener.Start()
+    } catch {
+        Write-Host "Failed to bind requested prefixes, falling back to localhost only..." -ForegroundColor Yellow
+        $listener = New-Object System.Net.HttpListener
+        $listener.Prefixes.Add("http://localhost:$Port/")
+        $listener.Prefixes.Add("http://127.0.0.1:$Port/")
+        $listener.Start()
+    }
+}
+
+Write-Host "==========================================================================" -ForegroundColor Green
+Write-Host "  AUGUSTA VICTORIA HOSPITAL - STAFF OCCUPATIONAL HEALTH & VACCINATION" -ForegroundColor Green
+Write-Host "==========================================================================" -ForegroundColor Green
+Write-Host " Computer (Local Browser): http://localhost:$Port/" -ForegroundColor Cyan
+if ($Https) {
+    Write-Host " Secure HTTPS Endpoint  : https://localhost:$HttpsPort/" -ForegroundColor Cyan
+}
+if ($networkBound -and $ipAddresses.Count -gt 0) {
+    Write-Host " Mobile & iPad Access (Active on same Wi-Fi / Hospital LAN):" -ForegroundColor Yellow
+    foreach ($ip in $ipAddresses) {
+        Write-Host "   --> http://$ip`:$Port/" -ForegroundColor Green
+        if ($Https) {
+            Write-Host "   --> https://$ip`:$HttpsPort/" -ForegroundColor Green
+        }
+    }
+} else {
+    Write-Host " Server Mode: Secure Localhost Only" -ForegroundColor Yellow
+    Write-Host " To open on Mobile / iPad: Run 'Setup_Mobile_Access.bat' once as Administrator," -ForegroundColor Gray
+    Write-Host " then launch with 'start_server_lan.bat'." -ForegroundColor Gray
+}
+Write-Host "==========================================================================" -ForegroundColor Green
+Write-Host "Press Ctrl+C in this terminal window to stop the server."
+Write-Host ""
+
+# In-memory Server Session Store: Token -> @{ user = ...; expiresAt = ... }
+$global:ServerSessions = @{}
+
+# Master File Paths
+$usersJsonPath     = Join-Path -Path $PSScriptRoot -ChildPath "server_data\users.json"
+$masterJsonPath    = Join-Path -Path $PSScriptRoot -ChildPath "server_data\avh_staff_2026_master.json"
+$masterJsPath      = Join-Path -Path $PSScriptRoot -ChildPath "js\avh_staff_master_data.js"
+$haiMasterJsonPath = Join-Path -Path $PSScriptRoot -ChildPath "server_data\hai_cases_master.json"
+$haiMasterJsPath   = Join-Path -Path $PSScriptRoot -ChildPath "js\hai_cases_master_data.js"
+$hmisMasterJsonPath = Join-Path -Path $PSScriptRoot -ChildPath "server_data\avh_hmis_isolation_archive.json"
+$hmisMasterJsPath  = Join-Path -Path $PSScriptRoot -ChildPath "js\avh_hmis_isolation_master_data.js"
+
+# SQLite Native Database Initialization
+$sqliteDbPath = Join-Path -Path $PSScriptRoot -ChildPath "server_data\avh_occupational_health.db"
+$backupsDir   = Join-Path -Path $PSScriptRoot -ChildPath "server_data\backups"
+$enginePath   = Join-Path -Path $PSScriptRoot -ChildPath "server_data\AvhSqliteEngine.ps1"
+if (Test-Path $enginePath) {
+    . $enginePath
+    $global:AvhDb = Initialize-AvhDatabase -dbPath $sqliteDbPath
+    Write-Host " [DB] Connected to Native SQLite Central Database: $sqliteDbPath" -ForegroundColor Cyan
+    try {
+        $syncResult = Sync-AvhInitialStaffBaseline -db $global:AvhDb -masterJsonPath $masterJsonPath
+        if ($syncResult.status -eq 'success') {
+            Write-Host " [DB] First startup: Imported $($syncResult.imported) packaged staff records into central SQLite." -ForegroundColor Green
+        } elseif ($syncResult.status -eq 'existing_preserved') {
+            Write-Host " [DB] Existing database preserved ($($syncResult.count) records). Migration marker recorded." -ForegroundColor Gray
+        }
+    } catch {
+        Write-Warning "Failed during staff baseline check/import: $($_.Exception.Message)"
+    }
+} else {
+    Write-Warning "AvhSqliteEngine.ps1 not found, database functionality limited"
+}
+
+# Designated Owner Account (Strict Access Control)
+$global:OwnerUsername = if ($env:AVH_OWNER_ACCOUNT) { $env:AVH_OWNER_ACCOUNT } else { $OwnerAccount }
+Write-Host " [AUTH] Designated Record Deletion Owner Account: '$global:OwnerUsername'" -ForegroundColor Yellow
+$global:LastBackupCheck = [DateTime]::UtcNow
+
+# Ensure legacy files in js\ are safely migrated to server_data\ if needed
+$legacyStaffJson = Join-Path -Path $PSScriptRoot -ChildPath "js\avh_staff_2026_master.json"
+if ((Test-Path $legacyStaffJson) -and (-not (Test-Path $masterJsonPath))) {
+    Copy-Item $legacyStaffJson $masterJsonPath -Force
+}
+$legacyHaiJson = Join-Path -Path $PSScriptRoot -ChildPath "js\hai_cases_master.json"
+if ((Test-Path $legacyHaiJson) -and (-not (Test-Path $haiMasterJsonPath))) {
+    Copy-Item $legacyHaiJson $haiMasterJsonPath -Force
+}
+
+# --- Helper Functions ---
+function Hash-Password([string]$pass, [string]$salt) {
+    $bytes = [System.Text.Encoding]::UTF8.GetBytes($pass + $salt)
+    $sha = [System.Security.Cryptography.SHA256]::Create()
+    $hashBytes = $sha.ComputeHash($bytes)
+    return -join ($hashBytes | ForEach-Object { '{0:x2}' -f $_ })
+}
+
+Add-Type -AssemblyName System.Web.Extensions
+$global:JsonSerializer = New-Object System.Web.Script.Serialization.JavaScriptSerializer
+$global:JsonSerializer.MaxJsonLength = [int]::MaxValue
+
+function ConvertFrom-JsonSafe([string]$jsonStr) {
+    if ([string]::IsNullOrWhiteSpace($jsonStr)) { return $null }
+    try {
+        return ($jsonStr | ConvertFrom-Json -ErrorAction Stop)
+    } catch {
+        try {
+            return $global:JsonSerializer.DeserializeObject($jsonStr)
+        } catch {
+            throw $_
+        }
+    }
+}
+
+function Get-RequestPayloadString($request) {
+    # Default to UTF-8 per RFC 8259 for JSON
+    $enc = [System.Text.Encoding]::UTF8
+    if ($null -ne $request.ContentType -and $request.ContentType -match 'charset=([^\s;]+)') {
+        try {
+            $enc = [System.Text.Encoding]::GetEncoding($matches[1])
+        } catch {
+            $enc = [System.Text.Encoding]::UTF8
+        }
+    }
+    $streamReader = New-Object System.IO.StreamReader($request.InputStream, $enc)
+    $text = $streamReader.ReadToEnd()
+    $streamReader.Close()
+    return $text
+}
+
+function Send-JsonResponse($response, [int]$statusCode, [object]$data) {
+    try {
+        $json = if ($null -eq $data) {
+            "null"
+        } elseif ($data -is [string]) {
+            $data
+        } else {
+            $converted = ConvertTo-Json -InputObject $data -Depth 15 -Compress
+            if ($null -eq $converted -or $converted -eq "") {
+                if ($data -is [System.Collections.IEnumerable] -and -not ($data -is [System.Collections.IDictionary])) {
+                    "[]"
+                } else {
+                    "{}"
+                }
+            } else {
+                $converted
+            }
+        }
+        $bytes = [System.Text.Encoding]::UTF8.GetBytes($json)
+        $response.StatusCode = $statusCode
+        $response.ContentType = 'application/json; charset=utf-8'
+        $response.ContentLength64 = $bytes.Length
+        $response.OutputStream.Write($bytes, 0, $bytes.Length)
+        $response.OutputStream.Close()
+    } catch [System.Net.HttpListenerException], [System.IO.IOException], [System.ObjectDisposedException] {
+        try { $response.Abort() } catch {}
+    } catch {
+        try { $response.OutputStream.Close() } catch {}
+    }
+}
+
+function Send-ErrorResponse($response, [int]$statusCode, [string]$message) {
+    Send-JsonResponse $response $statusCode @{ status = 'error'; message = $message }
+}
+
+function Get-AuthenticatedSession($request) {
+    $authHeader = $request.Headers['Authorization']
+    $token = ""
+    if ($authHeader -and $authHeader.StartsWith("Bearer ", [System.StringComparison]::OrdinalIgnoreCase)) {
+        $token = $authHeader.Substring(7).Trim()
+    } elseif ($request.Headers['X-Auth-Token']) {
+        $token = $request.Headers['X-Auth-Token'].Trim()
+    }
+
+    if ($token) {
+        if ($global:ServerSessions.ContainsKey($token)) {
+            $session = $global:ServerSessions[$token]
+            if ($session.expiresAt -gt [DateTime]::UtcNow) {
+                # Sliding expiration: extend session
+                $session.expiresAt = [DateTime]::UtcNow.AddHours(24)
+                return $session
+            } else {
+                $global:ServerSessions.Remove($token)
+            }
+        }
+
+        # Check persisted SQLite sessions
+        try {
+            if ($null -ne $global:AvhDb) {
+                $nowStr = [DateTime]::UtcNow.ToString("o")
+                $sParams = New-DbParameters @{ token = $token; now = $nowStr }
+                $sRow = $global:AvhDb.QueryRow("SELECT user_json, expires_at FROM user_sessions WHERE token = @token AND expires_at > @now;", $sParams)
+                if ($null -ne $sRow -and $sRow["user_json"]) {
+                    $uObj = $sRow["user_json"] | ConvertFrom-Json
+                    $session = @{
+                        user      = $uObj
+                        createdAt = [DateTime]::UtcNow
+                        expiresAt = [DateTime]::UtcNow.AddHours(24)
+                    }
+                    $global:ServerSessions[$token] = $session
+                    return $session
+                }
+            }
+        } catch {}
+    }
+
+    # Seamless fallback for Localhost / Desktop Standalone execution
+    $isLocal = $false
+    try {
+        if ($request.IsLocal) {
+            $isLocal = $true
+        } elseif ($null -ne $request.RemoteEndPoint -and $null -ne $request.RemoteEndPoint.Address) {
+            $addr = $request.RemoteEndPoint.Address.ToString()
+            if ($addr -eq '127.0.0.1' -or $addr -eq '::1' -or $addr -eq 'localhost') {
+                $isLocal = $true
+            }
+        }
+    } catch {}
+
+    if ($isLocal) {
+        try {
+            if (Test-Path $usersJsonPath) {
+                $uData = Get-Content $usersJsonPath -Raw -Encoding UTF8 | ConvertFrom-Json
+                $uObj = $null
+                $uArr = @($uData)
+                if ($uData -isnot [Array] -and $uData.value) { $uArr = @($uData.value) }
+                foreach ($candidate in $uArr) {
+                    if ($candidate.username -and $candidate.username.ToLower() -eq 'hammam') {
+                        $uObj = $candidate
+                        break
+                    }
+                }
+                if ($null -eq $uObj -and $uArr.Count -gt 0) { $uObj = $uArr[0] }
+
+                if ($null -ne $uObj) {
+                    return @{
+                        user = @{
+                            id             = $uObj.id
+                            username       = $uObj.username
+                            name           = $uObj.name
+                            role           = $uObj.role
+                            department     = $uObj.department
+                            jobTitle       = $uObj.jobTitle
+                            authorizations = $uObj.authorizations
+                        }
+                        createdAt = [DateTime]::UtcNow
+                        expiresAt = [DateTime]::UtcNow.AddHours(24)
+                    }
+                }
+            }
+        } catch {}
+    }
+
+    return $null
+}
+
+function Get-EmployeeNumber($e) {
+    $v = ""
+    if ($null -ne $e.empNo -and [string]$e.empNo -ne "") { $v = [string]$e.empNo }
+    elseif ($null -ne $e.id -and [string]$e.id -ne "") { $v = [string]$e.id }
+    elseif ($null -ne $e.employeeNumber -and [string]$e.employeeNumber -ne "") { $v = [string]$e.employeeNumber }
+    elseif ($null -ne $e.demographic -and $null -ne $e.demographic.personNumber) { $v = [string]$e.demographic.personNumber }
+    return $v.Trim().TrimStart('0')
+}
+
+function Get-NationalId($e) {
+    $v = ""
+    if ($null -ne $e.idNo -and [string]$e.idNo -ne "") { $v = [string]$e.idNo }
+    elseif ($null -ne $e.nationalId -and [string]$e.nationalId -ne "") { $v = [string]$e.nationalId }
+    elseif ($null -ne $e.demographic -and $null -ne $e.demographic.nationalId) { $v = [string]$e.demographic.nationalId }
+    return $v.Trim().TrimStart('0')
+}
+
+function Get-FullName($e) {
+    $v = ""
+    if ($null -ne $e.name -and [string]$e.name -ne "") { $v = [string]$e.name }
+    elseif ($null -ne $e.fullName -and [string]$e.fullName -ne "") { $v = [string]$e.fullName }
+    elseif ($null -ne $e.demographic -and $null -ne $e.demographic.fullName) { $v = [string]$e.demographic.fullName }
+    return $v.Trim().ToLower()
+}
+
+# Server Origins Whitelist for CORS
+$validServerOrigins = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+$validServerOrigins.Add("http://localhost:$Port") | Out-Null
+$validServerOrigins.Add("http://127.0.0.1:$Port") | Out-Null
+if ($Https) {
+    $validServerOrigins.Add("https://localhost:$HttpsPort") | Out-Null
+    $validServerOrigins.Add("https://127.0.0.1:$HttpsPort") | Out-Null
+}
+if ($AllowNetworkAccess) {
+    foreach ($ip in $ipAddresses) {
+        $validServerOrigins.Add("http://$ip`:$Port") | Out-Null
+        if ($Https) {
+            $validServerOrigins.Add("https://$ip`:$HttpsPort") | Out-Null
+        }
+    }
+}
+
+while ($true) {
+    try {
+        if ($null -eq $listener -or -not $listener.IsListening) {
+            try { if ($listener) { $listener.Close() } } catch {}
+            $listener = New-Object System.Net.HttpListener
+            $listener.Prefixes.Add("http://localhost:$Port/")
+            $listener.Prefixes.Add("http://127.0.0.1:$Port/")
+            if ($AllowNetworkAccess) {
+                foreach ($ip in $ipAddresses) {
+                    try { $listener.Prefixes.Add("http://" + $ip + ":$Port/") } catch {}
+                }
+            }
+            $listener.Start()
+            Write-Host " [RECOVERY] HttpListener auto-restarted on port $Port." -ForegroundColor Green
+        }
+
+        while ($listener.IsListening) {
+            try {
+                $context = $listener.GetContext()
+            } catch [System.Net.HttpListenerException] {
+                if (-not $listener.IsListening) { break }
+                Start-Sleep -Milliseconds 100
+                continue
+            } catch {
+                if (-not $listener.IsListening) { break }
+                Start-Sleep -Milliseconds 100
+                continue
+            }
+
+            try {
+                $request = $context.Request
+                $response = $context.Response
+
+                # CORS Headers - Restricted to configured server origins instead of reflecting arbitrary origins
+                $origin = $request.Headers['Origin']
+                $allowedOrigin = "http://localhost:$Port"
+                if ($origin -and $validServerOrigins.Contains($origin)) {
+                    $allowedOrigin = $origin
+                }
+                $response.Headers.Add('Access-Control-Allow-Origin', $allowedOrigin)
+                $response.Headers.Add('Access-Control-Allow-Methods', 'GET, POST, OPTIONS, DELETE')
+                $response.Headers.Add('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Auth-Token')
+                $response.Headers.Add('Access-Control-Allow-Credentials', 'true')
+
+                if ($request.HttpMethod -eq 'OPTIONS') {
+                    $response.StatusCode = 200
+                    try { $response.OutputStream.Close() } catch {}
+                    continue
+                }
+
+                $localPath = $request.Url.LocalPath
+
+                # API: GET /api/health (Self-Healing Health Check Endpoint)
+                if ($localPath -eq '/api/health') {
+                    $response.StatusCode = 200
+                    $response.ContentType = 'application/json; charset=utf-8'
+                    $hb = [System.Text.Encoding]::UTF8.GetBytes('{"status":"ok","timestamp":"' + (Get-Date -Format 'o') + '"}')
+                    $response.ContentLength64 = $hb.Length
+                    $response.OutputStream.Write($hb, 0, $hb.Length)
+                    $response.OutputStream.Close()
+                    continue
+                }
+
+        # =====================================================================
+        # AUTHENTICATION API ROUTES (PUBLIC)
+        # =====================================================================
+
+        # API: POST /api/auth/login
+        if ($localPath -eq '/api/auth/login' -and $request.HttpMethod -eq 'POST') {
+            try {
+                $body = Get-RequestPayloadString $request
+                $payload = ConvertFrom-JsonSafe $body
+                $username = if ($payload.username) { [string]$payload.username } else { "" }
+                $password = if ($payload.password) { [string]$payload.password } else { "" }
+
+                $cleanUser = $username.Trim().ToLower()
+                $cleanPass = $password.Trim()
+
+                # Reject empty username or empty password strictly
+                if (-not $cleanUser -or -not $cleanPass) {
+                    Send-ErrorResponse $response 400 "Username and password are required"
+                    continue
+                }
+
+                if (-not (Test-Path $usersJsonPath)) {
+                    Send-ErrorResponse $response 500 "User configuration store not found on server"
+                    continue
+                }
+
+                $usersRaw = Get-Content $usersJsonPath -Raw -Encoding UTF8 | ConvertFrom-Json
+                $users = @($usersRaw)
+                if ($usersRaw -isnot [Array] -and $usersRaw.value) {
+                    $users = @($usersRaw.value)
+                }
+                $user = $null
+                foreach ($u in $users) {
+                    if ($u.username -and $u.username.ToLower() -eq $cleanUser) {
+                        $user = $u
+                        break
+                    }
+                }
+
+                if ($null -eq $user) {
+                    Send-ErrorResponse $response 401 "Invalid username or password"
+                    continue
+                }
+
+                # Salted hash verification
+                $salt = if ($user.salt) { [string]$user.salt } else { "" }
+                $computedHash = Hash-Password $cleanPass $salt
+
+                if ($computedHash -ne $user.passwordHash) {
+                    Send-ErrorResponse $response 401 "Invalid username or password"
+                    continue
+                }
+
+                # Generate secure server-managed session token
+                $sessionToken = [System.Guid]::NewGuid().ToString('N') + [System.Guid]::NewGuid().ToString('N')
+                $safeUser = @{
+                    id             = $user.id
+                    username       = $user.username
+                    name           = $user.name
+                    role           = $user.role
+                    department     = $user.department
+                    jobTitle       = $user.jobTitle
+                    authorizations = $user.authorizations
+                }
+
+                $nowUtc = [DateTime]::UtcNow
+                $expUtc = $nowUtc.AddHours(24)
+                $global:ServerSessions[$sessionToken] = @{
+                    user      = $safeUser
+                    createdAt = $nowUtc
+                    expiresAt = $expUtc
+                }
+
+                # Persist in SQLite user_sessions table
+                try {
+                    if ($null -ne $global:AvhDb) {
+                        $sessParams = New-DbParameters @{
+                            token      = $sessionToken
+                            username   = $safeUser.username
+                            user_json  = (ConvertTo-Json -InputObject $safeUser -Compress)
+                            created_at = $nowUtc.ToString("o")
+                            expires_at = $expUtc.ToString("o")
+                        }
+                        $global:AvhDb.ExecuteNonQuery("INSERT OR REPLACE INTO user_sessions (token, username, user_json, created_at, expires_at) VALUES (@token, @username, @user_json, @created_at, @expires_at);", $sessParams) | Out-Null
+                    }
+                } catch {}
+
+                Send-JsonResponse $response 200 @{
+                    success = $true
+                    status  = "success"
+                    token   = $sessionToken
+                    user    = $safeUser
+                }
+            } catch {
+                Send-ErrorResponse $response 500 $_.Exception.Message
+            }
+            continue
+        }
+
+        # API: GET /api/auth/session
+        if ($localPath -eq '/api/auth/session' -and $request.HttpMethod -eq 'GET') {
+            $session = Get-AuthenticatedSession $request
+            if ($null -ne $session) {
+                Send-JsonResponse $response 200 @{ success = $true; status = "success"; user = $session.user }
+            } else {
+                Send-ErrorResponse $response 401 "No active session or session expired"
+            }
+            continue
+        }
+
+        # API: POST /api/auth/logout
+        if ($localPath -eq '/api/auth/logout' -and $request.HttpMethod -eq 'POST') {
+            $authHeader = $request.Headers['Authorization']
+            $token = ""
+            if ($authHeader -and $authHeader.StartsWith("Bearer ", [System.StringComparison]::OrdinalIgnoreCase)) {
+                $token = $authHeader.Substring(7).Trim()
+            } elseif ($request.Headers['X-Auth-Token']) {
+                $token = $request.Headers['X-Auth-Token'].Trim()
+            }
+            if ($token) {
+                if ($global:ServerSessions.ContainsKey($token)) {
+                    $global:ServerSessions.Remove($token)
+                }
+                try {
+                    if ($null -ne $global:AvhDb) {
+                        $delParams = New-DbParameters @{ token = $token }
+                        $global:AvhDb.ExecuteNonQuery("DELETE FROM user_sessions WHERE token = @token;", $delParams) | Out-Null
+                    }
+                } catch {}
+            }
+            Send-JsonResponse $response 200 @{ status = "success"; message = "Logged out successfully" }
+            continue
+        }
+
+        # =====================================================================
+        # USER MANAGEMENT & PERMISSIONS APIS (ADMIN PRIVILEGES)
+        # =====================================================================
+
+        # API: GET /api/users
+        if ($localPath -eq '/api/users' -and $request.HttpMethod -eq 'GET') {
+            $session = Get-AuthenticatedSession $request
+            if ($null -eq $session) {
+                Send-ErrorResponse $response 401 "Authentication required"
+                continue
+            }
+            if ($session.user.role -ne 'admin' -and -not ($session.user.authorizations -and $session.user.authorizations.systemManagement)) {
+                Send-ErrorResponse $response 403 "Admin privileges required to access user list"
+                continue
+            }
+
+            try {
+                if (-not (Test-Path $usersJsonPath)) {
+                    Send-JsonResponse $response 200 @()
+                    continue
+                }
+                $usersRaw = Get-Content $usersJsonPath -Raw -Encoding UTF8 | ConvertFrom-Json
+                $users = @($usersRaw)
+                if ($usersRaw -isnot [Array] -and $usersRaw.value) { $users = @($usersRaw.value) }
+
+                $safeList = [System.Collections.Generic.List[Object]]::new()
+                foreach ($u in $users) {
+                    $safeList.Add(@{
+                        id             = $u.id
+                        username       = $u.username
+                        name           = $u.name
+                        role           = $u.role
+                        department     = $u.department
+                        jobTitle       = $u.jobTitle
+                        authorizations = $u.authorizations
+                    })
+                }
+                Send-JsonResponse $response 200 $safeList
+            } catch {
+                Send-ErrorResponse $response 500 $_.Exception.Message
+            }
+            continue
+        }
+
+        # API: POST /api/users/save (Create or Update User Role & Authorities)
+        if ($localPath -eq '/api/users/save' -and $request.HttpMethod -eq 'POST') {
+            $session = Get-AuthenticatedSession $request
+            if ($null -eq $session -or ($session.user.role -ne 'admin' -and -not ($session.user.authorizations -and $session.user.authorizations.systemManagement))) {
+                Send-ErrorResponse $response 403 "Admin privileges required to save user settings"
+                continue
+            }
+
+            try {
+                $body = Get-RequestPayloadString $request
+                $payload = ConvertFrom-JsonSafe $body
+                if (-not $payload -or -not $payload.username) {
+                    Send-ErrorResponse $response 400 "Username is required"
+                    continue
+                }
+
+                $cleanUser = ([string]$payload.username).Trim().ToLower()
+                $usersRaw = Get-Content $usersJsonPath -Raw -Encoding UTF8 | ConvertFrom-Json
+                $users = [System.Collections.ArrayList]::new(@($usersRaw))
+                if ($usersRaw -isnot [Array] -and $usersRaw.value) { $users = [System.Collections.ArrayList]::new(@($usersRaw.value)) }
+
+                $targetUser = $null
+                $targetIndex = -1
+                for ($i = 0; $i -lt $users.Count; $i++) {
+                    if (($payload.id -and $users[$i].id -eq $payload.id) -or ($users[$i].username -and $users[$i].username.ToLower() -eq $cleanUser)) {
+                        $targetUser = $users[$i]
+                        $targetIndex = $i
+                        break
+                    }
+                }
+
+                if ($null -ne $targetUser) {
+                    # Update existing user
+                    if ($payload.name) { $targetUser.name = [string]$payload.name }
+                    if ($payload.department) { $targetUser.department = [string]$payload.department }
+                    if ($payload.jobTitle) { $targetUser.jobTitle = [string]$payload.jobTitle }
+                    if ($payload.role) { $targetUser.role = [string]$payload.role }
+                    if ($payload.authorizations) {
+                        $targetUser.authorizations = $payload.authorizations
+                    }
+                    if ($payload.password -and [string]$payload.password.Trim() -ne "") {
+                        $salt = [System.Guid]::NewGuid().ToString('N')
+                        $targetUser.salt = $salt
+                        $targetUser.passwordHash = Hash-Password ([string]$payload.password).Trim() $salt
+                    }
+                    $users[$targetIndex] = $targetUser
+                } else {
+                    # Create new user
+                    $newPass = if ($payload.password) { [string]$payload.password } else { "123456" }
+                    $salt = [System.Guid]::NewGuid().ToString('N')
+                    $hash = Hash-Password $newPass.Trim() $salt
+                    $newId = if ($payload.id) { [string]$payload.id } else { "u_" + $cleanUser }
+
+                    $auths = if ($payload.authorizations) {
+                        $payload.authorizations
+                    } else {
+                        @{
+                            occHealthModule      = $true
+                            vaccinationForms     = $true
+                            injuryReport         = $true
+                            vaccinationReports   = $true
+                            certificateGenerator = $true
+                            systemManagement     = ($payload.role -eq 'admin')
+                        }
+                    }
+
+                    $newUser = [PSCustomObject]@{
+                        id             = $newId
+                        username       = $cleanUser
+                        name           = if ($payload.name) { [string]$payload.name } else { $cleanUser }
+                        jobTitle       = if ($payload.jobTitle) { [string]$payload.jobTitle } else { "Staff" }
+                        department     = if ($payload.department) { [string]$payload.department } else { "General" }
+                        role           = if ($payload.role) { [string]$payload.role } else { "employee" }
+                        mustChangePassword = $false
+                        salt           = $salt
+                        passwordHash   = $hash
+                        authorizations = $auths
+                    }
+                    $users.Add($newUser) | Out-Null
+                    $targetUser = $newUser
+                }
+
+                $users | ConvertTo-Json -Depth 10 | Set-Content -Path $usersJsonPath -Encoding UTF8
+                if ($global:AvhDb) {
+                    Write-DbAuditLog $global:AvhDb "user" $cleanUser "SAVE" $session.user.username $request.RemoteEndPoint.Address.ToString() "Updated/created user account $cleanUser"
+                }
+
+                Send-JsonResponse $response 200 @{
+                    success = $true
+                    status  = "success"
+                    user    = @{
+                        id             = $targetUser.id
+                        username       = $targetUser.username
+                        name           = $targetUser.name
+                        role           = $targetUser.role
+                        department     = $targetUser.department
+                        jobTitle       = $targetUser.jobTitle
+                        authorizations = $targetUser.authorizations
+                    }
+                }
+            } catch {
+                Send-ErrorResponse $response 500 $_.Exception.Message
+            }
+            continue
+        }
+
+        # API: POST /api/users/reset-password
+        if ($localPath -eq '/api/users/reset-password' -and $request.HttpMethod -eq 'POST') {
+            $session = Get-AuthenticatedSession $request
+            if ($null -eq $session -or ($session.user.role -ne 'admin' -and -not ($session.user.authorizations -and $session.user.authorizations.systemManagement))) {
+                Send-ErrorResponse $response 403 "Admin privileges required to reset passwords"
+                continue
+            }
+
+            try {
+                $body = Get-RequestPayloadString $request
+                $payload = ConvertFrom-JsonSafe $body
+                $uId = [string]$payload.userId
+                $newPass = [string]$payload.newPassword
+
+                if (-not $uId -or -not $newPass -or $newPass.Trim() -eq "") {
+                    Send-ErrorResponse $response 400 "User ID and new password are required"
+                    continue
+                }
+
+                $usersRaw = Get-Content $usersJsonPath -Raw -Encoding UTF8 | ConvertFrom-Json
+                $users = [System.Collections.ArrayList]::new(@($usersRaw))
+                if ($usersRaw -isnot [Array] -and $usersRaw.value) { $users = [System.Collections.ArrayList]::new(@($usersRaw.value)) }
+
+                $found = $false
+                for ($i = 0; $i -lt $users.Count; $i++) {
+                    if ($users[$i].id -eq $uId -or ($users[$i].username -and $users[$i].username.ToLower() -eq $uId.ToLower())) {
+                        $salt = [System.Guid]::NewGuid().ToString('N')
+                        $users[$i].salt = $salt
+                        $users[$i].passwordHash = Hash-Password $newPass.Trim() $salt
+                        $found = $true
+                        break
+                    }
+                }
+
+                if (-not $found) {
+                    Send-ErrorResponse $response 404 "User not found"
+                    continue
+                }
+
+                $users | ConvertTo-Json -Depth 10 | Set-Content -Path $usersJsonPath -Encoding UTF8
+                if ($global:AvhDb) {
+                    Write-DbAuditLog $global:AvhDb "user" $uId "PASSWORD_RESET" $session.user.username $request.RemoteEndPoint.Address.ToString() "Reset password for user $uId"
+                }
+
+                Send-JsonResponse $response 200 @{ success = $true; status = "success"; message = "Password updated successfully" }
+            } catch {
+                Send-ErrorResponse $response 500 $_.Exception.Message
+            }
+            continue
+        }
+
+        # API: POST /api/users/delete
+        if ($localPath -eq '/api/users/delete' -and $request.HttpMethod -eq 'POST') {
+            $session = Get-AuthenticatedSession $request
+            if ($null -eq $session -or $session.user.role -ne 'admin') {
+                Send-ErrorResponse $response 403 "Admin privileges required to delete user accounts"
+                continue
+            }
+
+            try {
+                $body = Get-RequestPayloadString $request
+                $payload = ConvertFrom-JsonSafe $body
+                $uId = [string]$payload.userId
+
+                if (-not $uId) {
+                    Send-ErrorResponse $response 400 "User ID is required"
+                    continue
+                }
+
+                if ($session.user.id -eq $uId -or $session.user.username.ToLower() -eq $uId.ToLower() -or $uId.ToLower() -eq $global:OwnerUsername.ToLower()) {
+                    Send-ErrorResponse $response 400 "Cannot delete designated owner or active logged-in account"
+                    continue
+                }
+
+                $usersRaw = Get-Content $usersJsonPath -Raw -Encoding UTF8 | ConvertFrom-Json
+                $users = [System.Collections.ArrayList]::new(@($usersRaw))
+                if ($usersRaw -isnot [Array] -and $usersRaw.value) { $users = [System.Collections.ArrayList]::new(@($usersRaw.value)) }
+
+                $targetIdx = -1
+                for ($i = 0; $i -lt $users.Count; $i++) {
+                    if ($users[$i].id -eq $uId -or ($users[$i].username -and $users[$i].username.ToLower() -eq $uId.ToLower())) {
+                        $targetIdx = $i
+                        break
+                    }
+                }
+
+                if ($targetIdx -ne -1) {
+                    $deletedUser = $users[$targetIdx].username
+                    $users.RemoveAt($targetIdx)
+                    $users | ConvertTo-Json -Depth 10 | Set-Content -Path $usersJsonPath -Encoding UTF8
+                    if ($global:AvhDb) {
+                        Write-DbAuditLog $global:AvhDb "user" $deletedUser "DELETE" $session.user.username $request.RemoteEndPoint.Address.ToString() "Deleted user $deletedUser"
+                    }
+                }
+
+                Send-JsonResponse $response 200 @{ success = $true; status = "success"; message = "User deleted successfully" }
+            } catch {
+                Send-ErrorResponse $response 500 $_.Exception.Message
+            }
+            continue
+        }
+
+        # =====================================================================
+        # PROTECTED CLINICAL & EMPLOYEE DATA APIS (SQLITE NATIVE / CENTRAL DB)
+        # =====================================================================
+
+        # Periodic background online backup check (every 6 hours)
+        if ($global:AvhDb -and (([DateTime]::UtcNow - $global:LastBackupCheck).TotalHours -ge 6)) {
+            $global:LastBackupCheck = [DateTime]::UtcNow
+            Backup-AvhDatabase $global:AvhDb $sqliteDbPath $backupsDir | Out-Null
+        }
+
+        # ---------------------------------------------------------------------
+        # API: GET /api/employees
+        # ---------------------------------------------------------------------
+        if ($localPath -eq '/api/employees' -and $request.HttpMethod -eq 'GET') {
+            $session = Get-AuthenticatedSession $request
+            if ($null -eq $session) {
+                Send-ErrorResponse $response 401 "Authentication required to access employee records"
+                continue
+            }
+
+            try {
+                if ($null -ne $global:AvhDb) {
+                    $rows = $global:AvhDb.Query("SELECT data_json, version, updated_at FROM employees WHERE is_deleted = 0 ORDER BY full_name ASC;")
+                    $list = [System.Collections.Generic.List[Object]]::new()
+                    foreach ($r in $rows) {
+                        $raw = $r["data_json"]
+                        if ($raw) {
+                            try {
+                                $obj = ConvertFrom-JsonSafe $raw
+                                $obj | Add-Member -NotePropertyName "_version" -NotePropertyValue ([int]$r["version"]) -Force
+                                $obj | Add-Member -NotePropertyName "_serverUpdatedAt" -NotePropertyValue ([string]$r["updated_at"]) -Force
+                                $list.Add($obj)
+                            } catch {}
+                        }
+                    }
+                    Send-JsonResponse $response 200 $list
+                } elseif (Test-Path -Path $masterJsonPath) {
+                    $bytes = [System.IO.File]::ReadAllBytes($masterJsonPath)
+                    $response.StatusCode = 200
+                    $response.ContentType = 'application/json; charset=utf-8'
+                    $response.ContentLength64 = $bytes.Length
+                    $response.OutputStream.Write($bytes, 0, $bytes.Length)
+                    $response.OutputStream.Close()
+                } else {
+                    Send-ErrorResponse $response 404 "Master dataset not found"
+                }
+            } catch {
+                Send-ErrorResponse $response 500 $_.Exception.Message
+            }
+            continue
+        }
+
+        # ---------------------------------------------------------------------
+        # API: POST /api/employees/save
+        # ---------------------------------------------------------------------
+        if ($localPath -eq '/api/employees/save' -and $request.HttpMethod -eq 'POST') {
+            $session = Get-AuthenticatedSession $request
+            if ($null -eq $session) {
+                Send-ErrorResponse $response 401 "Authentication required to modify employee records"
+                continue
+            }
+            $isAuditor = ($session.user.role -eq 'auditor')
+            $canEdit = (-not $isAuditor) -and ($session.user.role -eq 'admin' -or $session.user.role -eq 'occ_health' -or ($session.user.authorizations -and $session.user.authorizations.occHealthModule))
+            if (-not $canEdit) {
+                Send-ErrorResponse $response 403 "Forbidden: Insufficient privileges to save employee records"
+                continue
+            }
+
+            try {
+                $body = Get-RequestPayloadString $request
+                $payload = ConvertFrom-JsonSafe $body
+                $targetItems = @()
+                if ($payload.employee) {
+                    $targetItems = @($payload.employee)
+                } elseif ($payload.employees) {
+                    $targetItems = @($payload.employees)
+                } elseif ($payload -is [Array]) {
+                    $targetItems = $payload
+                } else {
+                    $targetItems = @($payload)
+                }
+
+                $savedList = [System.Collections.Generic.List[Object]]::new()
+                $global:AvhDb.BeginTransaction()
+                $now = (Get-Date).ToString("o")
+                $user = $session.user.username
+                $lastVersion = 1
+                $lastIsNew = $true
+
+                try {
+                    foreach ($emp in $targetItems) {
+                        $tEmpNo = Get-EmployeeNumber $emp
+                        $tIdNo  = Get-NationalId $emp
+                        $tName  = Get-FullName $emp
+                        $demo   = if ($emp.demographic) { $emp.demographic } else { @{} }
+                        $lab    = if ($emp.labResults) { $emp.labResults } else { @{} }
+
+                        # Validation
+                        if (-not $tName -or (-not $tEmpNo -and -not $tIdNo)) {
+                            throw "Validation Error: Employee record must contain a valid name and either an Employee Number or National ID."
+                        }
+                        if (-not $tEmpNo) { $tEmpNo = "EMP-$tIdNo" }
+                        if (-not $tIdNo)  { $tIdNo = "ID-$tEmpNo" }
+
+                        # Optimistic Concurrency Check
+                        $chkParams = New-DbParameters @{ emp_no = $tEmpNo; national_id = $tIdNo }
+                        $existingRow = $global:AvhDb.QueryRow("SELECT id, version, is_deleted, updated_by, updated_at, data_json FROM employees WHERE (emp_no = @emp_no OR national_id = @national_id);", $chkParams)
+
+                        $clientVersion = if ($null -ne $emp._version) { [int]$emp._version } elseif ($null -ne $payload.expectedVersion) { [int]$payload.expectedVersion } else { 0 }
+
+                        if ($null -ne $existingRow) {
+                            $dbVersion = [int]$existingRow["version"]
+                            $lastIsNew = $false
+                            $isForced = ($null -ne $payload.force -and $payload.force -eq $true) -or ($payload.actionType -eq 'update' -or $payload.actionType -eq 'save' -or $payload.actionType -eq 'force_update')
+                            if ($clientVersion -gt 0 -and $clientVersion -lt $dbVersion -and -not $isForced) {
+                                throw "CONCURRENCY_CONFLICT: Record was modified by $($existingRow['updated_by']) at $($existingRow['updated_at']). Current server version is v$dbVersion, your draft is v$clientVersion. Please reload the latest changes."
+                            }
+                            $lastVersion = [Math]::Max($dbVersion, $clientVersion) + 1
+
+                            $emp | Add-Member -NotePropertyName "_version" -NotePropertyValue $lastVersion -Force
+                            $emp | Add-Member -NotePropertyName "_serverUpdatedAt" -NotePropertyValue $now -Force
+                            $dataJson = ConvertTo-Json -InputObject $emp -Depth 12 -Compress
+
+                            $updParams = New-DbParameters @{
+                                id                 = $existingRow["id"]
+                                emp_no             = $tEmpNo
+                                national_id        = $tIdNo
+                                full_name          = $tName
+                                arabic_name        = $(if ($demo.arabicFullName) { [string]$demo.arabicFullName } else { "" })
+                                department         = $(if ($emp.department) { [string]$emp.department } elseif ($demo.department) { [string]$demo.department } else { "General" })
+                                job_title          = $(if ($emp.jobTitle) { [string]$emp.jobTitle } elseif ($demo.positionName) { [string]$demo.positionName } else { "Staff" })
+                                dob                = $(if ($emp.dob) { [string]$emp.dob } elseif ($demo.dob) { [string]$demo.dob } else { "" })
+                                hepb_titer         = $(if ($emp.hepbTiter) { [string]$emp.hepbTiter } elseif ($lab.hbsabResult) { [string]$lab.hbsabResult } else { "" })
+                                immunity_status    = $(if ($emp.immunityStatus) { [string]$emp.immunityStatus } else { "Pending Verification" })
+                                staff_group        = $(if ($emp.staffGroup) { [string]$emp.staffGroup } elseif ($demo.staffGroup) { [string]$demo.staffGroup } else { "Standard" })
+                                invasive_procedure = $(if ($emp.invasiveProcedure) { [string]$emp.invasiveProcedure } else { "No" })
+                                data_json          = $dataJson
+                                version            = $lastVersion
+                                updated_at         = $now
+                                updated_by         = $user
+                            }
+
+                            $updSql = @"
+                            UPDATE employees SET
+                                emp_no = @emp_no, national_id = @national_id, full_name = @full_name, arabic_name = @arabic_name,
+                                department = @department, job_title = @job_title, dob = @dob, hepb_titer = @hepb_titer,
+                                immunity_status = @immunity_status, staff_group = @staff_group, invasive_procedure = @invasive_procedure,
+                                data_json = @data_json, version = @version, is_deleted = 0, updated_at = @updated_at, updated_by = @updated_by
+                            WHERE id = @id;
+"@
+                            $global:AvhDb.ExecuteNonQuery($updSql, $updParams) | Out-Null
+                            Write-DbAuditLog $global:AvhDb "employee" $tEmpNo "UPDATE" $user $request.RemoteEndPoint.Address.ToString() "Updated employee $tName (v$lastVersion)"
+                        } else {
+                            $lastVersion = 1
+                            $lastIsNew = $true
+                            $emp | Add-Member -NotePropertyName "_version" -NotePropertyValue $lastVersion -Force
+                            $emp | Add-Member -NotePropertyName "_serverUpdatedAt" -NotePropertyValue $now -Force
+                            $dataJson = ConvertTo-Json -InputObject $emp -Depth 12 -Compress
+
+                            $insParams = New-DbParameters @{
+                                emp_no             = $tEmpNo
+                                national_id        = $tIdNo
+                                full_name          = $tName
+                                arabic_name        = $(if ($demo.arabicFullName) { [string]$demo.arabicFullName } else { "" })
+                                department         = $(if ($emp.department) { [string]$emp.department } elseif ($demo.department) { [string]$demo.department } else { "General" })
+                                job_title          = $(if ($emp.jobTitle) { [string]$emp.jobTitle } elseif ($demo.positionName) { [string]$demo.positionName } else { "Staff" })
+                                dob                = $(if ($emp.dob) { [string]$emp.dob } elseif ($demo.dob) { [string]$demo.dob } else { "" })
+                                hepb_titer         = $(if ($emp.hepbTiter) { [string]$emp.hepbTiter } elseif ($lab.hbsabResult) { [string]$lab.hbsabResult } else { "" })
+                                immunity_status    = $(if ($emp.immunityStatus) { [string]$emp.immunityStatus } else { "Pending Verification" })
+                                staff_group        = $(if ($emp.staffGroup) { [string]$emp.staffGroup } elseif ($demo.staffGroup) { [string]$demo.staffGroup } else { "Standard" })
+                                invasive_procedure = $(if ($emp.invasiveProcedure) { [string]$emp.invasiveProcedure } else { "No" })
+                                data_json          = $dataJson
+                                version            = $lastVersion
+                                created_at         = $now
+                                updated_at         = $now
+                                created_by         = $user
+                                updated_by         = $user
+                            }
+
+                            $insSql = @"
+                            INSERT INTO employees (
+                                emp_no, national_id, full_name, arabic_name, department, job_title,
+                                dob, hepb_titer, immunity_status, staff_group, invasive_procedure,
+                                data_json, version, is_deleted, created_at, updated_at, created_by, updated_by
+                            ) VALUES (
+                                @emp_no, @national_id, @full_name, @arabic_name, @department, @job_title,
+                                @dob, @hepb_titer, @immunity_status, @staff_group, @invasive_procedure,
+                                @data_json, @version, 0, @created_at, @updated_at, @created_by, @updated_by
+                            );
+"@
+                            $global:AvhDb.ExecuteNonQuery($insSql, $insParams) | Out-Null
+                            Write-DbAuditLog $global:AvhDb "employee" $tEmpNo "CREATE" $user $request.RemoteEndPoint.Address.ToString() "Created employee $tName"
+                        }
+                        $savedList.Add($emp)
+                    }
+
+                    $global:AvhDb.Commit()
+
+                    Send-JsonResponse $response 200 @{
+                        success  = $true
+                        status   = "success"
+                        message  = if ($lastIsNew) { "Employee registered successfully in central database" } else { "Employee record updated successfully in central database" }
+                        employee = if ($savedList.Count -eq 1) { $savedList[0] } else { $null }
+                        count    = $savedList.Count
+                        version  = $lastVersion
+                        isNew    = $lastIsNew
+                        action   = if ($lastIsNew) { "created" } else { "updated" }
+                    }
+                } catch {
+                    $global:AvhDb.Rollback()
+                    $errMsg = [string]$_.Exception.Message
+                    if ($errMsg -like "*CONCURRENCY_CONFLICT*") {
+                        Send-JsonResponse $response 409 @{
+                            status  = "conflict"
+                            error   = $errMsg
+                            code    = "CONCURRENCY_CONFLICT"
+                        }
+                    } else {
+                        Send-ErrorResponse $response 400 $errMsg
+                    }
+                }
+            } catch {
+                Send-ErrorResponse $response 500 $_.Exception.Message
+            }
+            continue
+        }
+
+        # ---------------------------------------------------------------------
+        # API: POST /api/employees/delete (STRICT OWNER ONLY - RECOVERABLE)
+        # ---------------------------------------------------------------------
+        if ($localPath -eq '/api/employees/delete' -and $request.HttpMethod -eq 'POST') {
+            $session = Get-AuthenticatedSession $request
+            if ($null -eq $session) {
+                Send-ErrorResponse $response 401 "Authentication required to delete employee records"
+                continue
+            }
+
+            $currentUser = $session.user.username
+            if ($currentUser.ToLower() -ne $global:OwnerUsername.ToLower()) {
+                Send-JsonResponse $response 403 @{
+                    status  = "forbidden"
+                    error   = "Permission Denied: Only the designated system owner ('$global:OwnerUsername') is permitted to delete records. Other roles cannot delete clinical/staff records."
+                    code    = "OWNER_ONLY_ACTION"
+                }
+                continue
+            }
+
+            try {
+                $body = Get-RequestPayloadString $request
+                $payload = ConvertFrom-JsonSafe $body
+                $deleteId = ""
+                if ($payload.id) { $deleteId = [string]$payload.id }
+                elseif ($payload.empNo) { $deleteId = [string]$payload.empNo }
+                elseif ($payload.idNo) { $deleteId = [string]$payload.idNo }
+                elseif ($payload.employeeNumber) { $deleteId = [string]$payload.employeeNumber }
+                elseif ($payload.personNumber) { $deleteId = [string]$payload.personNumber }
+                elseif ($payload.nationalId) { $deleteId = [string]$payload.nationalId }
+                $dId = $deleteId.Trim()
+
+                if (-not $dId) {
+                    Send-ErrorResponse $response 400 "Invalid deletion request: Missing identifier"
+                    continue
+                }
+
+                $now = (Get-Date).ToString("o")
+                $delParams = New-DbParameters @{
+                    target_id  = $dId
+                    deleted_at = $now
+                    deleted_by = $currentUser
+                }
+
+                $delSql = @"
+                UPDATE employees SET
+                    is_deleted = 1,
+                    deleted_at = @deleted_at,
+                    deleted_by = @deleted_by,
+                    version = version + 1
+                WHERE (emp_no = @target_id OR national_id = @target_id OR id = @target_id)
+                  AND is_deleted = 0;
+"@
+                $affected = $global:AvhDb.ExecuteNonQuery($delSql, $delParams)
+                if ($affected -gt 0) {
+                    Write-DbAuditLog $global:AvhDb "employee" $dId "SOFT_DELETE" $currentUser $request.RemoteEndPoint.Address.ToString() "Soft-deleted employee $dId (Recoverable)"
+                    Send-JsonResponse $response 200 @{
+                        success  = $true
+                        status   = "success"
+                        message  = "Record moved to trash (recoverable by owner)"
+                        affected = $affected
+                    }
+                } else {
+                    Send-ErrorResponse $response 404 "Employee record not found or already deleted"
+                }
+            } catch {
+                Send-ErrorResponse $response 500 $_.Exception.Message
+            }
+            continue
+        }
+
+        # ---------------------------------------------------------------------
+        # API: GET /api/employees/trash (OWNER ONLY)
+        # ---------------------------------------------------------------------
+        if ($localPath -eq '/api/employees/trash' -and $request.HttpMethod -eq 'GET') {
+            $session = Get-AuthenticatedSession $request
+            if ($null -eq $session -or $session.user.username.ToLower() -ne $global:OwnerUsername.ToLower()) {
+                Send-ErrorResponse $response 403 "Owner access required to view deleted records"
+                continue
+            }
+            $rows = $global:AvhDb.Query("SELECT emp_no AS id, emp_no, national_id, full_name, department, job_title, deleted_at, deleted_by, version FROM employees WHERE is_deleted = 1 ORDER BY deleted_at DESC;")
+            Send-JsonResponse $response 200 $rows
+            continue
+        }
+
+        # ---------------------------------------------------------------------
+        # API: POST /api/employees/restore (OWNER ONLY)
+        # ---------------------------------------------------------------------
+        if ($localPath -eq '/api/employees/restore' -and $request.HttpMethod -eq 'POST') {
+            $session = Get-AuthenticatedSession $request
+            if ($null -eq $session -or $session.user.username.ToLower() -ne $global:OwnerUsername.ToLower()) {
+                Send-ErrorResponse $response 403 "Owner access required to restore records"
+                continue
+            }
+            $payload = ConvertFrom-JsonSafe (Get-RequestPayloadString $request)
+            $restoreId = [string]$payload.id
+            $rstParams = New-DbParameters @{ target_id = $restoreId }
+            $rstSql = "UPDATE employees SET is_deleted = 0, deleted_at = NULL, deleted_by = NULL, version = version + 1 WHERE (emp_no = @target_id OR national_id = @target_id) AND is_deleted = 1;"
+            $affected = $global:AvhDb.ExecuteNonQuery($rstSql, $rstParams)
+            if ($affected -gt 0) {
+                Write-DbAuditLog $global:AvhDb "employee" $restoreId "RESTORE" $session.user.username $request.RemoteEndPoint.Address.ToString() "Restored employee $restoreId from trash"
+                Send-JsonResponse $response 200 @{ success = $true; status = "success"; message = "Record restored successfully" }
+            } else {
+                Send-ErrorResponse $response 404 "Record not found in trash"
+            }
+            continue
+        }
+
+        # ---------------------------------------------------------------------
+        # API: GET & POST /api/vaccine_batches (CENTRAL VACCINE STOCK STORE)
+        # ---------------------------------------------------------------------
+        if ($localPath -eq '/api/vaccine_batches') {
+            $vaccineJsonPath = Join-Path $PSScriptRoot "server_data\vaccine_batches.json"
+            if ($request.HttpMethod -eq 'GET') {
+                try {
+                    $jsonStr = $null
+                    if ($global:AvhDb) {
+                        try {
+                            $meta = $global:AvhDb.QueryRow("SELECT value FROM system_meta WHERE key = 'vaccine_batches';")
+                            if ($meta -and $meta["value"]) {
+                                $jsonStr = $meta["value"]
+                            }
+                        } catch {}
+                    }
+                    if (-not $jsonStr -and (Test-Path $vaccineJsonPath)) {
+                        $jsonStr = Get-Content -Path $vaccineJsonPath -Raw -Encoding UTF8
+                    }
+                    if (-not $jsonStr) {
+                        $jsonStr = "[]"
+                    }
+                    $list = ConvertFrom-JsonSafe $jsonStr
+                    Send-JsonResponse $response 200 $list
+                } catch {
+                    Send-ErrorResponse $response 500 $_.Exception.Message
+                }
+                continue
+            }
+            if ($request.HttpMethod -eq 'POST') {
+                try {
+                    $raw = Get-RequestPayloadString $request
+                    $payload = ConvertFrom-JsonSafe $raw
+                    $list = if ($payload.batches) { $payload.batches } else { $payload }
+                    $cleanJson = ConvertTo-Json -InputObject $list -Depth 10 -Compress
+                    
+                    if ($global:AvhDb) {
+                        try {
+                            $mParams = New-DbParameters @{
+                                key = "vaccine_batches"
+                                val = $cleanJson
+                                updated_at = (Get-Date).ToString("yyyy-MM-dd HH:mm:ss")
+                            }
+                            $global:AvhDb.ExecuteNonQuery("INSERT OR REPLACE INTO system_meta (key, value, updated_at) VALUES (@key, @val, @updated_at);", $mParams) | Out-Null
+                        } catch {}
+                    }
+                    [System.IO.File]::WriteAllText($vaccineJsonPath, $cleanJson, [System.Text.Encoding]::UTF8)
+                    Send-JsonResponse $response 200 @{ status = "success"; count = $list.Count }
+                } catch {
+                    Send-ErrorResponse $response 500 $_.Exception.Message
+                }
+                continue
+            }
+        }
+
+        # ---------------------------------------------------------------------
+        # API: GET & POST /api/dropdown_options (CENTRAL MASTER DROPDOWNS STORE)
+        # ---------------------------------------------------------------------
+        if ($localPath -eq '/api/dropdown_options') {
+            $dropdownJsonPath = Join-Path $PSScriptRoot "server_data\dropdown_options.json"
+            if ($request.HttpMethod -eq 'GET') {
+                try {
+                    $jsonStr = $null
+                    if ($global:AvhDb) {
+                        try {
+                            $meta = $global:AvhDb.QueryRow("SELECT value FROM system_meta WHERE key = 'dropdown_options';")
+                            if ($meta -and $meta["value"]) {
+                                $jsonStr = $meta["value"]
+                            }
+                        } catch {}
+                    }
+                    if (-not $jsonStr -and (Test-Path $dropdownJsonPath)) {
+                        $jsonStr = Get-Content -Path $dropdownJsonPath -Raw -Encoding UTF8
+                    }
+                    if (-not $jsonStr) {
+                        $jsonStr = "{}"
+                    }
+                    $data = ConvertFrom-JsonSafe $jsonStr
+                    Send-JsonResponse $response 200 $data
+                } catch {
+                    Send-ErrorResponse $response 500 $_.Exception.Message
+                }
+                continue
+            }
+            if ($request.HttpMethod -eq 'POST') {
+                try {
+                    $raw = Get-RequestPayloadString $request
+                    $cleanJson = $raw
+                    if ($global:AvhDb) {
+                        try {
+                            $mParams = New-DbParameters @{
+                                key = "dropdown_options"
+                                val = $cleanJson
+                                updated_at = (Get-Date).ToString("yyyy-MM-dd HH:mm:ss")
+                            }
+                            $global:AvhDb.ExecuteNonQuery("INSERT OR REPLACE INTO system_meta (key, value, updated_at) VALUES (@key, @val, @updated_at);", $mParams) | Out-Null
+                        } catch {}
+                    }
+                    [System.IO.File]::WriteAllText($dropdownJsonPath, $cleanJson, [System.Text.Encoding]::UTF8)
+                    Send-JsonResponse $response 200 @{ status = "success" }
+                } catch {
+                    Send-ErrorResponse $response 500 $_.Exception.Message
+                }
+                continue
+            }
+        }
+
+        # ---------------------------------------------------------------------
+        # API: GET /api/injuries (SQE 02.01 CENTRAL INJURY STORE)
+        # ---------------------------------------------------------------------
+        if ($localPath -eq '/api/injuries' -and $request.HttpMethod -eq 'GET') {
+            $session = Get-AuthenticatedSession $request
+            if ($null -eq $session) {
+                Send-ErrorResponse $response 401 "Authentication required"
+                continue
+            }
+            try {
+                $rows = $global:AvhDb.Query("SELECT data_json, serial_no, version, updated_at FROM injury_reports WHERE is_deleted = 0 ORDER BY incident_date DESC, id DESC;")
+                $list = [System.Collections.Generic.List[Object]]::new()
+                foreach ($r in $rows) {
+                    if ($r["data_json"]) {
+                        try {
+                            $obj = ConvertFrom-JsonSafe $r["data_json"]
+                            $obj | Add-Member -NotePropertyName "_version" -NotePropertyValue ([int]$r["version"]) -Force
+                            $obj | Add-Member -NotePropertyName "_serverUpdatedAt" -NotePropertyValue ([string]$r["updated_at"]) -Force
+                            $list.Add($obj)
+                        } catch {}
+                    }
+                }
+                Send-JsonResponse $response 200 $list
+            } catch {
+                Send-ErrorResponse $response 500 $_.Exception.Message
+            }
+            continue
+        }
+
+        # ---------------------------------------------------------------------
+        # API: POST /api/injuries/save (ATOMIC SERIAL & TRANSACTIONAL PEP SYNC)
+        # ---------------------------------------------------------------------
+        if ($localPath -eq '/api/injuries/save' -and $request.HttpMethod -eq 'POST') {
+            $session = Get-AuthenticatedSession $request
+            if ($null -eq $session) {
+                Send-ErrorResponse $response 401 "Authentication required"
+                continue
+            }
+            $isAuditor = ($session.user.role -eq 'auditor')
+            $canEdit = (-not $isAuditor) -and ($session.user.role -eq 'admin' -or $session.user.role -eq 'occ_health' -or ($session.user.authorizations -and $session.user.authorizations.injuryReport))
+            if (-not $canEdit) {
+                Send-ErrorResponse $response 403 "Forbidden: Insufficient privileges to save injury incident reports"
+                continue
+            }
+            try {
+                $payload = ConvertFrom-JsonSafe (Get-RequestPayloadString $request)
+
+                $report = if ($payload.report) { $payload.report } elseif ($payload.injury) { $payload.injury } else { $payload }
+                if ($report.value) { $report = $report.value }
+                if ($report -is [System.Collections.IEnumerable] -and -not ($report -is [string]) -and $report.Count -gt 0) { $report = $report[0] }
+
+                $part1 = if ($report.part1) { $report.part1 } else { @{} }
+                $empName = if ($report.employeeName) { [string]$report.employeeName } elseif ($part1 -and $part1.name) { [string]$part1.name } else { "" }
+                $fileNo = if ($part1.fileNo) { [string]$part1.fileNo } elseif ($report.empNo) { [string]$report.empNo } elseif ($report.fileNo) { [string]$report.fileNo } else { "" }
+                $incDate = if ($report.incidentDate) { [string]$report.incidentDate } elseif ($part1.dateTime) { [string]$part1.dateTime } else { (Get-Date).ToString("dd/MM/yyyy") }
+                $now = (Get-Date).ToString("o")
+                $user = $session.user.username
+
+                if (-not $empName) {
+                    Send-ErrorResponse $response 400 "Validation Error: Employee name is required for injury incident report"
+                    continue
+                }
+
+                $global:AvhDb.BeginTransaction()
+                try {
+                    $serialNo = if ($report.serialNo) { [string]$report.serialNo } elseif ($report.id) { [string]$report.id } elseif ($report.part1 -and $report.part1.serialNo) { [string]$report.part1.serialNo } else { "" }
+                    $isNew = $false
+                    if (-not $serialNo) {
+                        $isNew = $true
+                        $cleanFile = ($fileNo -replace '[^0-9]', '')
+                        if (-not $cleanFile) { $cleanFile = "001" }
+                        $year = (Get-Date).Year
+                        $cntRow = $global:AvhDb.QueryRow("SELECT COUNT(*) AS c FROM injury_reports WHERE serial_no LIKE 'INC-$year-$cleanFile-%';")
+                        $nextSeq = ([int]$cntRow["c"]) + 1
+                        $serialNo = "INC-$year-$cleanFile-$($nextSeq.ToString('D2'))"
+                        $report | Add-Member -NotePropertyName "serialNo" -NotePropertyValue $serialNo -Force
+                    }
+                    $report | Add-Member -NotePropertyName "serialNo" -NotePropertyValue $serialNo -Force
+                    $report | Add-Member -NotePropertyName "id" -NotePropertyValue $serialNo -Force
+
+                    $report | Add-Member -NotePropertyName "_serverUpdatedAt" -NotePropertyValue $now -Force
+
+                    $chkParams = New-DbParameters @{ serial_no = $serialNo }
+                    $existing = $global:AvhDb.QueryRow("SELECT id, version FROM injury_reports WHERE serial_no = @serial_no;", $chkParams)
+
+                    $version = 1
+                    if ($null -ne $existing) {
+                        $version = ([int]$existing["version"]) + 1
+                        $report | Add-Member -NotePropertyName "_version" -NotePropertyValue $version -Force
+                        $dataJson = ConvertTo-Json -InputObject $report -Depth 12 -Compress
+
+                        $uParams = New-DbParameters @{
+                            id            = $existing["id"]
+                            emp_name      = $empName
+                            emp_no        = $fileNo
+                            dept          = [string]$part1.department
+                            job_title     = [string]$part1.position
+                            incident_date = $incDate
+                            report_date   = if ($report.reportDate) { [string]$report.reportDate } else { $incDate }
+                            incident_type = if ($report.incidentType) { [string]$report.incidentType } else { "Needlestick / Sharps" }
+                            exposure_type = if ($report.exposureType) { [string]$report.exposureType } else { "Percutaneous" }
+                            data_json     = $dataJson
+                            version       = $version
+                            updated_at    = $now
+                            updated_by    = $user
+                        }
+                        $global:AvhDb.ExecuteNonQuery(@"
+                        UPDATE injury_reports SET
+                            employee_name = @emp_name, emp_no = @emp_no, department = @dept, job_title = @job_title,
+                            incident_date = @incident_date, report_date = @report_date, incident_type = @incident_type,
+                            exposure_type = @exposure_type, data_json = @data_json, version = @version, is_deleted = 0,
+                            updated_at = @updated_at, updated_by = @updated_by
+                        WHERE id = @id;
+"@, $uParams) | Out-Null
+                        Write-DbAuditLog $global:AvhDb "injury" $serialNo "UPDATE" $user $request.RemoteEndPoint.Address.ToString() "Updated injury report $serialNo"
+                    } else {
+                        $isNew = $true
+                        $version = 1
+                        $report | Add-Member -NotePropertyName "_version" -NotePropertyValue $version -Force
+                        $dataJson = ConvertTo-Json -InputObject $report -Depth 12 -Compress
+
+                        $iParams = New-DbParameters @{
+                            serial_no     = $serialNo
+                            emp_name      = $empName
+                            emp_no        = $fileNo
+                            national_id   = $(if ($part1.nationalId) { [string]$part1.nationalId } else { "" })
+                            dept          = [string]$part1.department
+                            job_title     = [string]$part1.position
+                            incident_date = $incDate
+                            report_date   = if ($report.reportDate) { [string]$report.reportDate } else { $incDate }
+                            incident_type = if ($report.incidentType) { [string]$report.incidentType } else { "Needlestick / Sharps" }
+                            exposure_type = if ($report.exposureType) { [string]$report.exposureType } else { "Percutaneous" }
+                            data_json     = $dataJson
+                            version       = $version
+                            created_at    = $now
+                            updated_at    = $now
+                            created_by    = $user
+                            updated_by    = $user
+                        }
+                        $global:AvhDb.ExecuteNonQuery(@"
+                        INSERT INTO injury_reports (
+                            serial_no, emp_no, national_id, employee_name, department, job_title,
+                            incident_date, report_date, incident_type, exposure_type, data_json,
+                            version, is_deleted, created_at, updated_at, created_by, updated_by
+                        ) VALUES (
+                            @serial_no, @emp_no, @national_id, @emp_name, @dept, @job_title,
+                            @incident_date, @report_date, @incident_type, @exposure_type, @data_json,
+                            @version, 0, @created_at, @updated_at, @created_by, @updated_by
+                        );
+"@, $iParams) | Out-Null
+                        Write-DbAuditLog $global:AvhDb "injury" $serialNo "CREATE" $user $request.RemoteEndPoint.Address.ToString() "Created injury report $serialNo"
+                    }
+
+                    # Auto-update worker PEP record in SQLite
+                    if ($fileNo) {
+                        $empRow = $global:AvhDb.QueryRow("SELECT id, data_json FROM employees WHERE (emp_no = @f OR national_id = @f) AND is_deleted = 0;", (New-DbParameters @{ f = $fileNo }))
+                        if ($null -ne $empRow) {
+                            try {
+                                $matchedEmp = ConvertFrom-JsonSafe $empRow["data_json"]
+                                if (-not $matchedEmp.pep) { $matchedEmp | Add-Member -NotePropertyName "pep" -NotePropertyValue ([PSCustomObject]@{}) -Force }
+                                if (-not $matchedEmp.pep.additionalPepRecords) { $matchedEmp.pep | Add-Member -NotePropertyName "additionalPepRecords" -NotePropertyValue @() -Force }
+                                $pepRec = [PSCustomObject]@{
+                                    serialNo     = $serialNo
+                                    incidentDate = $incDate
+                                    protocol     = "HBIG / Tetanus / PEP Baseline Protocol (SQE 02.01)"
+                                    indication   = "Occupational Exposure ($serialNo)"
+                                    status       = "In Progress"
+                                    date         = $incDate
+                                }
+                                $curList = [System.Collections.Generic.List[Object]]::new()
+                                $curList.Add($pepRec)
+                                if ($matchedEmp.pep.additionalPepRecords) {
+                                    foreach ($p in $matchedEmp.pep.additionalPepRecords) {
+                                        if ($p.serialNo -ne $serialNo) { $curList.Add($p) }
+                                    }
+                                }
+                                $matchedEmp.pep.additionalPepRecords = $curList.ToArray()
+                                $updatedEmpJson = ConvertTo-Json -InputObject $matchedEmp -Depth 12 -Compress
+                                $global:AvhDb.ExecuteNonQuery("UPDATE employees SET data_json = @dj, updated_at = @now WHERE id = @eid;", (New-DbParameters @{ dj = $updatedEmpJson; now = $now; eid = $empRow["id"] })) | Out-Null
+                            } catch {}
+                        }
+                    }
+
+                    $global:AvhDb.Commit()
+
+                    Send-JsonResponse $response 200 @{
+                        success  = $true
+                        status   = "success"
+                        message  = if ($isNew) { "Injury incident report ($serialNo) saved successfully to database" } else { "Injury incident report ($serialNo) updated successfully" }
+                        serialNo = $serialNo
+                        id       = $serialNo
+                        report   = $report
+                        injury   = $report
+                        version  = $version
+                        isNew    = $lastIsNew
+                    }
+                } catch {
+                    $global:AvhDb.Rollback()
+                    Send-ErrorResponse $response 500 $_.Exception.Message
+                }
+            } catch {
+                Send-ErrorResponse $response 500 $_.Exception.Message
+            }
+            continue
+        }
+
+        # ---------------------------------------------------------------------
+        # API: POST /api/injuries/delete (OWNER ONLY - SOFT DELETE)
+        # ---------------------------------------------------------------------
+        if ($localPath -eq '/api/injuries/delete' -and $request.HttpMethod -eq 'POST') {
+            $session = Get-AuthenticatedSession $request
+            if ($null -eq $session) {
+                Send-ErrorResponse $response 401 "Authentication required"
+                continue
+            }
+            $currentUser = $session.user.username
+            if ($currentUser.ToLower() -ne $global:OwnerUsername.ToLower()) {
+                Send-JsonResponse $response 403 @{
+                    status = "forbidden"
+                    error  = "Permission Denied: Only designated owner ('$global:OwnerUsername') can delete injury records"
+                    code   = "OWNER_ONLY_ACTION"
+                }
+                continue
+            }
+            $payload = ConvertFrom-JsonSafe (Get-RequestPayloadString $request)
+            $serialNo = if ($payload.serialNo) { [string]$payload.serialNo } elseif ($payload.id) { [string]$payload.id } elseif ($payload.serial) { [string]$payload.serial } else { "" }
+            $now = (Get-Date).ToString("o")
+
+            $delParams = New-DbParameters @{ serial_no = $serialNo; deleted_at = $now; deleted_by = $currentUser }
+            $affected = $global:AvhDb.ExecuteNonQuery("UPDATE injury_reports SET is_deleted = 1, deleted_at = @deleted_at, deleted_by = @deleted_by WHERE serial_no = @serial_no AND is_deleted = 0;", $delParams)
+            if ($affected -gt 0) {
+                Write-DbAuditLog $global:AvhDb "injury" $serialNo "SOFT_DELETE" $currentUser $request.RemoteEndPoint.Address.ToString() "Soft-deleted injury report $serialNo"
+                Send-JsonResponse $response 200 @{ success = $true; status = "success"; message = "Injury record moved to trash" }
+            } else {
+                Send-ErrorResponse $response 404 "Injury report not found or already deleted"
+            }
+            continue
+        }
+
+        # ---------------------------------------------------------------------
+        # API: GET /api/injuries/trash & POST /api/injuries/restore
+        # ---------------------------------------------------------------------
+        if ($localPath -eq '/api/injuries/trash' -and $request.HttpMethod -eq 'GET') {
+            $session = Get-AuthenticatedSession $request
+            if ($null -eq $session -or $session.user.username.ToLower() -ne $global:OwnerUsername.ToLower()) {
+                Send-ErrorResponse $response 403 "Owner access required"
+                continue
+            }
+            $rows = $global:AvhDb.Query("SELECT serial_no AS id, serial_no, employee_name, emp_no, department, incident_date, deleted_at, deleted_by FROM injury_reports WHERE is_deleted = 1 ORDER BY deleted_at DESC;")
+            Send-JsonResponse $response 200 $rows
+            continue
+        }
+
+        if ($localPath -eq '/api/injuries/restore' -and $request.HttpMethod -eq 'POST') {
+            $session = Get-AuthenticatedSession $request
+            if ($null -eq $session -or $session.user.username.ToLower() -ne $global:OwnerUsername.ToLower()) {
+                Send-ErrorResponse $response 403 "Owner access required"
+                continue
+            }
+            $payload = ConvertFrom-JsonSafe (Get-RequestPayloadString $request)
+            $serialNo = if ($payload.serialNo) { [string]$payload.serialNo } elseif ($payload.id) { [string]$payload.id } elseif ($payload.serial) { [string]$payload.serial } else { "" }
+            $affected = $global:AvhDb.ExecuteNonQuery("UPDATE injury_reports SET is_deleted = 0, deleted_at = NULL, deleted_by = NULL WHERE serial_no = @serial_no AND is_deleted = 1;", (New-DbParameters @{ serial_no = $serialNo }))
+            if ($affected -gt 0) {
+                Write-DbAuditLog $global:AvhDb "injury" $serialNo "RESTORE" $session.user.username $request.RemoteEndPoint.Address.ToString() "Restored injury report $serialNo from trash"
+                Send-JsonResponse $response 200 @{ success = $true; status = "success"; message = "Injury report restored" }
+            } else {
+                Send-ErrorResponse $response 404 "Record not found in trash"
+            }
+            continue
+        }
+
+        # ---------------------------------------------------------------------
+        # API: GET & POST /api/certificates
+        # ---------------------------------------------------------------------
+        if ($localPath -eq '/api/certificates' -and $request.HttpMethod -eq 'GET') {
+            $session = Get-AuthenticatedSession $request
+            if ($null -eq $session) {
+                Send-ErrorResponse $response 401 "Authentication required"
+                continue
+            }
+            $rows = $global:AvhDb.Query("SELECT certificate_no, emp_no, employee_name, cert_type, issued_at, issued_by, data_json FROM certificate_issuances WHERE is_deleted = 0 ORDER BY id DESC;")
+            Send-JsonResponse $response 200 $rows
+            continue
+        }
+
+        if ($localPath -eq '/api/certificates/save' -and $request.HttpMethod -eq 'POST') {
+            $session = Get-AuthenticatedSession $request
+            if ($null -eq $session) {
+                Send-ErrorResponse $response 401 "Authentication required"
+                continue
+            }
+            $isAuditor = ($session.user.role -eq 'auditor')
+            $canEdit = (-not $isAuditor) -and ($session.user.role -eq 'admin' -or $session.user.role -eq 'occ_health' -or ($session.user.authorizations -and $session.user.authorizations.certificateGenerator))
+            if (-not $canEdit) {
+                Send-ErrorResponse $response 403 "Forbidden: Insufficient privileges to issue or save certificates"
+                continue
+            }
+            $payload = ConvertFrom-JsonSafe (Get-RequestPayloadString $request)
+
+            $cert = if ($payload.certificate) { $payload.certificate } else { $payload }
+            $empNo = [string]$(if ($cert.empNo) { $cert.empNo } elseif ($cert.employeeId) { $cert.employeeId } else { "" })
+            $empName = [string]$cert.employeeName
+            $certType = if ($cert.certificateType) { [string]$cert.certificateType } elseif ($cert.certType) { [string]$cert.certType } else { "Standard" }
+            $now = (Get-Date).ToString("o")
+            $user = $session.user.username
+
+            $year = (Get-Date).Year
+            $cnt = $global:AvhDb.ExecuteScalar("SELECT COUNT(*) FROM certificate_issuances;")
+            $certNo = "AVH-CERT-$year-" + (([int]$cnt) + 1).ToString("D4")
+
+            $cParams = New-DbParameters @{
+                cert_no   = $certNo
+                emp_no    = $empNo
+                nat_id    = $(if ($cert.nationalId) { [string]$cert.nationalId } else { "" })
+                emp_name  = $empName
+                cert_type = $certType
+                issued_at = $now
+                issued_by = $user
+                data_json = (ConvertTo-Json -InputObject $cert -Depth 10 -Compress)
+                created_at= $now
+            }
+
+            $cSql = @"
+            INSERT INTO certificate_issuances (certificate_no, emp_no, national_id, employee_name, cert_type, issued_at, issued_by, data_json, created_at)
+            VALUES (@cert_no, @emp_no, @nat_id, @emp_name, @cert_type, @issued_at, @issued_by, @data_json, @created_at);
+"@
+            $global:AvhDb.ExecuteNonQuery($cSql, $cParams) | Out-Null
+            Write-DbAuditLog $global:AvhDb "certificate" $certNo "CREATE" $user $request.RemoteEndPoint.Address.ToString() "Issued certificate $certNo to $empName"
+
+            Send-JsonResponse $response 200 @{
+                success           = $true
+                status            = "success"
+                message           = "Certificate issuance record saved"
+                certificateNo     = $certNo
+                certificateNumber = $certNo
+                issuedAt          = $now
+                issuedBy          = $user
+            }
+            continue
+        }
+
+        # ---------------------------------------------------------------------
+        # API: GET /api/audit-logs
+        # ---------------------------------------------------------------------
+        if ($localPath -eq '/api/audit-logs' -and $request.HttpMethod -eq 'GET') {
+            $session = Get-AuthenticatedSession $request
+            if ($null -eq $session -or ($session.user.role -ne 'admin' -and $session.user.username.ToLower() -ne $global:OwnerUsername.ToLower())) {
+                Send-ErrorResponse $response 403 "Admin access required to view audit logs"
+                continue
+            }
+            $logs = $global:AvhDb.Query("SELECT id, entity_type, entity_id, action, performed_by, ip_address, details_json, timestamp FROM audit_logs ORDER BY id DESC LIMIT 100;")
+            Send-JsonResponse $response 200 $logs
+            continue
+        }
+
+        # ---------------------------------------------------------------------
+        # API: GET /api/system/db-status & POST /api/system/backup
+        # ---------------------------------------------------------------------
+        if ($localPath -eq '/api/system/db-status' -and $request.HttpMethod -eq 'GET') {
+            $session = Get-AuthenticatedSession $request
+            if ($null -eq $session) {
+                Send-ErrorResponse $response 401 "Authentication required"
+                continue
+            }
+            $empCounts = $global:AvhDb.QueryRow("SELECT COUNT(*) AS total, SUM(CASE WHEN is_deleted = 0 THEN 1 ELSE 0 END) AS active, SUM(CASE WHEN is_deleted = 1 THEN 1 ELSE 0 END) AS deleted FROM employees;")
+            $injCounts = $global:AvhDb.QueryRow("SELECT COUNT(*) AS total, SUM(CASE WHEN is_deleted = 0 THEN 1 ELSE 0 END) AS active FROM injury_reports;")
+            $certCount = $global:AvhDb.ExecuteScalar("SELECT COUNT(*) FROM certificate_issuances;")
+            $auditCount = $global:AvhDb.ExecuteScalar("SELECT COUNT(*) FROM audit_logs;")
+            $dbSize = if (Test-Path $sqliteDbPath) { (Get-Item $sqliteDbPath).Length } else { 0 }
+            
+            $lastBackup = Get-ChildItem -Path $backupsDir -Filter "avh_occupational_health_backup_*.db" -ErrorAction SilentlyContinue |
+                          Sort-Object CreationTime -Descending | Select-Object -First 1
+
+            Send-JsonResponse $response 200 @{
+                status            = "online"
+                engine            = "SQLite Native (winsqlite3)"
+                dbPath            = $sqliteDbPath
+                dbSizeBytes       = $dbSize
+                dbSizeKb          = [Math]::Round($dbSize / 1024, 2)
+                totalEmployees    = [int]$empCounts["total"]
+                activeEmployees   = [int]$empCounts["active"]
+                deletedEmployees  = [int]$empCounts["deleted"]
+                activeInjuries    = [int]$injCounts["active"]
+                totalCertificates = [int]$certCount
+                totalAuditLogs    = [int]$auditCount
+                ownerAccount      = $global:OwnerUsername
+                lastBackupFile    = if ($lastBackup) { $lastBackup.Name } else { "None" }
+                lastBackupTime    = if ($lastBackup) { $lastBackup.CreationTime.ToString("o") } else { "None" }
+            }
+            continue
+        }
+
+        if ($localPath -eq '/api/system/backup' -and $request.HttpMethod -eq 'POST') {
+            $session = Get-AuthenticatedSession $request
+            if ($null -eq $session -or ($session.user.role -ne 'admin' -and $session.user.username.ToLower() -ne $global:OwnerUsername.ToLower())) {
+                Send-ErrorResponse $response 403 "Admin access required for backup"
+                continue
+            }
+            $res = Backup-AvhDatabase $global:AvhDb $sqliteDbPath $backupsDir
+            if ($res.success) {
+                Write-DbAuditLog $global:AvhDb "system" "backup" "BACKUP" $session.user.username $request.RemoteEndPoint.Address.ToString() "Created online backup $($res.fileName)"
+                Send-JsonResponse $response 200 $res
+            } else {
+                Send-ErrorResponse $response 500 $res.error
+            }
+            continue
+        }
+
+        # API: GET /api/hai-cases
+        if ($localPath -eq '/api/hai-cases' -and $request.HttpMethod -eq 'GET') {
+            $session = Get-AuthenticatedSession $request
+            if ($null -eq $session) {
+                Send-ErrorResponse $response 401 "Authentication required to access HAI case records"
+                continue
+            }
+
+            try {
+                if (Test-Path -Path $haiMasterJsonPath) {
+                    $bytes = [System.IO.File]::ReadAllBytes($haiMasterJsonPath)
+                    $response.StatusCode = 200
+                    $response.ContentType = 'application/json; charset=utf-8'
+                    $response.ContentLength64 = $bytes.Length
+                    $response.OutputStream.Write($bytes, 0, $bytes.Length)
+                } else {
+                    $resBytes = [System.Text.Encoding]::UTF8.GetBytes('[]')
+                    $response.StatusCode = 200
+                    $response.ContentType = 'application/json; charset=utf-8'
+                    $response.ContentLength64 = $resBytes.Length
+                    $response.OutputStream.Write($resBytes, 0, $resBytes.Length)
+                }
+            } catch {
+                Send-ErrorResponse $response 500 $_.Exception.Message
+            }
+            $response.OutputStream.Close()
+            continue
+        }
+
+        # API: POST /api/hai-cases/save
+        if ($localPath -eq '/api/hai-cases/save' -and $request.HttpMethod -eq 'POST') {
+            $session = Get-AuthenticatedSession $request
+            if ($null -eq $session) {
+                Send-ErrorResponse $response 401 "Authentication required to modify HAI cases"
+                continue
+            }
+            if ($session.user.role -ne 'admin' -and $session.user.role -ne 'occ_health') {
+                Send-ErrorResponse $response 403 "Forbidden: Insufficient privileges to save HAI cases"
+                continue
+            }
+
+            try {
+                $body = Get-RequestPayloadString $request
+                $payload = ConvertFrom-JsonSafe $body
+
+                $existingCases = @()
+                if (Test-Path -Path $haiMasterJsonPath) {
+                    $jsonRaw = [System.IO.File]::ReadAllText($haiMasterJsonPath, [System.Text.Encoding]::UTF8)
+                    if ($jsonRaw.Trim()) {
+                        $existingCases = $jsonRaw | ConvertFrom-Json
+                    }
+                }
+
+                $targetItems = @()
+                if ($payload.case) { $targetItems = @($payload.case) }
+                elseif ($payload.cases) { $targetItems = @($payload.cases) }
+                elseif ($payload -is [Array]) { $targetItems = $payload }
+                else { $targetItems = @($payload) }
+
+                $listObj = [System.Collections.Generic.List[Object]]::new()
+                if ($existingCases) {
+                    foreach ($item in $existingCases) { $listObj.Add($item) }
+                }
+
+                foreach ($target in $targetItems) {
+                    $targetId = ""
+                    if ($target.caseId) { $targetId = [string]$target.caseId }
+                    elseif ($target.id) { $targetId = [string]$target.id }
+                    $targetId = $targetId.Trim()
+                    if (-not $targetId) { continue }
+
+                    $matchIndex = -1
+                    for ($i = 0; $i -lt $listObj.Count; $i++) {
+                        $c = $listObj[$i]
+                        $cId = ""
+                        if ($c.caseId) { $cId = [string]$c.caseId }
+                        elseif ($c.id) { $cId = [string]$c.id }
+
+                        if ($cId.Trim() -eq $targetId) {
+                            $matchIndex = $i
+                            break
+                        }
+                    }
+
+                    if ($matchIndex -ge 0) {
+                        $listObj[$matchIndex] = $target
+                    } else {
+                        $listObj.Insert(0, $target)
+                    }
+                }
+
+                $updatedJsonStr = ConvertTo-Json -InputObject $listObj -Depth 12 -Compress
+
+                $tmpJson = $haiMasterJsonPath + ".tmp"
+                [System.IO.File]::WriteAllText($tmpJson, $updatedJsonStr, [System.Text.Encoding]::UTF8)
+                [System.IO.File]::Copy($tmpJson, $haiMasterJsonPath, $true)
+                Remove-Item -Path $tmpJson -Force -ErrorAction SilentlyContinue
+
+                $jsContent = "const AVH_HAI_MASTER_CASES = " + $updatedJsonStr + ";"
+                $tmpJs = $haiMasterJsPath + ".tmp"
+                [System.IO.File]::WriteAllText($tmpJs, $jsContent, [System.Text.Encoding]::UTF8)
+                [System.IO.File]::Copy($tmpJs, $haiMasterJsPath, $true)
+                Remove-Item -Path $tmpJs -Force -ErrorAction SilentlyContinue
+
+                Send-JsonResponse $response 200 @{
+                    status  = "success"
+                    message = "HAI Cases saved successfully"
+                    count   = $listObj.Count
+                }
+            } catch {
+                Send-ErrorResponse $response 500 $_.Exception.Message
+            }
+            continue
+        }
+
+        # API: POST /api/hai-cases/delete
+        if ($localPath -eq '/api/hai-cases/delete' -and $request.HttpMethod -eq 'POST') {
+            $session = Get-AuthenticatedSession $request
+            if ($null -eq $session) {
+                Send-ErrorResponse $response 401 "Authentication required to delete HAI cases"
+                continue
+            }
+            if ($session.user.role -ne 'admin' -and $session.user.role -ne 'occ_health') {
+                Send-ErrorResponse $response 403 "Forbidden: Insufficient privileges to delete HAI cases"
+                continue
+            }
+
+            try {
+                $body = Get-RequestPayloadString $request
+                $payload = ConvertFrom-JsonSafe $body
+                $deleteId = ""
+                if ($payload.caseId) { $deleteId = [string]$payload.caseId }
+                elseif ($payload.id) { $deleteId = [string]$payload.id }
+                $deleteId = $deleteId.Trim()
+
+                $existingCases = @()
+                if (Test-Path -Path $haiMasterJsonPath) {
+                    $jsonRaw = [System.IO.File]::ReadAllText($haiMasterJsonPath, [System.Text.Encoding]::UTF8)
+                    if ($jsonRaw.Trim()) {
+                        $existingCases = $jsonRaw | ConvertFrom-Json
+                    }
+                }
+
+                $listObj = [System.Collections.Generic.List[Object]]::new()
+                $deletedCount = 0
+                if ($existingCases) {
+                    foreach ($c in $existingCases) {
+                        $cId = ""
+                        if ($c.caseId) { $cId = [string]$c.caseId }
+                        elseif ($c.id) { $cId = [string]$c.id }
+
+                        if ($cId.Trim() -ne $deleteId) {
+                            $listObj.Add($c)
+                        } else {
+                            $deletedCount++
+                        }
+                    }
+                }
+
+                $updatedJsonStr = ConvertTo-Json -InputObject $listObj -Depth 12 -Compress
+                
+                $tmpJson = $haiMasterJsonPath + ".tmp"
+                [System.IO.File]::WriteAllText($tmpJson, $updatedJsonStr, [System.Text.Encoding]::UTF8)
+                [System.IO.File]::Copy($tmpJson, $haiMasterJsonPath, $true)
+                Remove-Item -Path $tmpJson -Force -ErrorAction SilentlyContinue
+
+                $jsContent = "const AVH_HAI_MASTER_CASES = " + $updatedJsonStr + ";"
+                $tmpJs = $haiMasterJsPath + ".tmp"
+                [System.IO.File]::WriteAllText($tmpJs, $jsContent, [System.Text.Encoding]::UTF8)
+                [System.IO.File]::Copy($tmpJs, $haiMasterJsPath, $true)
+                Remove-Item -Path $tmpJs -Force -ErrorAction SilentlyContinue
+
+                Send-JsonResponse $response 200 @{
+                    status       = "success"
+                    message      = "HAI Case deleted successfully"
+                    deletedCount = $deletedCount
+                    count        = $listObj.Count
+                }
+            } catch {
+                Send-ErrorResponse $response 500 $_.Exception.Message
+            }
+            continue
+        }
+
+        # API: GET /api/hmis-isolation
+        if ($localPath -eq '/api/hmis-isolation' -and $request.HttpMethod -eq 'GET') {
+            $session = Get-AuthenticatedSession $request
+            if ($null -eq $session) {
+                Send-ErrorResponse $response 401 "Authentication required to access HMIS isolation archive"
+                continue
+            }
+
+            try {
+                if (Test-Path -Path $hmisMasterJsonPath) {
+                    $raw = [System.IO.File]::ReadAllText($hmisMasterJsonPath, [System.Text.Encoding]::UTF8)
+                    if ($raw.Length -gt 0 -and $raw[0] -eq [char]0xFEFF) {
+                        $raw = $raw.Substring(1)
+                    }
+                    Send-JsonResponse $response 200 $raw
+                } else {
+                    Send-JsonResponse $response 200 '[]'
+                }
+            } catch {
+                Send-ErrorResponse $response 500 $_.Exception.Message
+            }
+            continue
+        }
+
+        # API: POST /api/hmis-isolation/save
+        if ($localPath -eq '/api/hmis-isolation/save' -and $request.HttpMethod -eq 'POST') {
+            $session = Get-AuthenticatedSession $request
+            if ($null -eq $session) {
+                Send-ErrorResponse $response 401 "Authentication required to modify isolation records"
+                continue
+            }
+            if ($session.user.role -ne 'admin' -and $session.user.role -ne 'occ_health') {
+                Send-ErrorResponse $response 403 "Forbidden: Insufficient privileges to save isolation records"
+                continue
+            }
+
+            try {
+                $body = Get-RequestPayloadString $request
+                $payload = ConvertFrom-JsonSafe $body
+                $archiveData = if ($payload.archive) { $payload.archive } else { $payload }
+
+                # Conflict / Revision protection: Merge incoming dates into existing vault by dateStr
+                $existingVault = @()
+                if (Test-Path -Path $hmisMasterJsonPath) {
+                    try {
+                        $rawServer = [System.IO.File]::ReadAllText($hmisMasterJsonPath, [System.Text.Encoding]::UTF8)
+                        $parsedServer = $rawServer | ConvertFrom-Json
+                        if ($parsedServer -is [System.Array]) {
+                            $existingVault = @($parsedServer)
+                        }
+                    } catch {}
+                }
+
+                $dateMap = [System.Collections.Specialized.OrderedDictionary]@{}
+                if (-not ($payload.replaceAll -eq $true)) {
+                    foreach ($entry in $existingVault) {
+                        if ($entry -and $entry.dateStr) {
+                            $key = $entry.dateStr.Trim()
+                            $dateMap[$key] = $entry
+                        }
+                    }
+                }
+                if ($payload.deletedDates) {
+                    foreach ($delKey in $payload.deletedDates) {
+                        $delKeyStr = $delKey.ToString().Trim()
+                        if ($dateMap.Contains($delKeyStr)) {
+                            $dateMap.Remove($delKeyStr)
+                        }
+                    }
+                }
+                foreach ($entry in $archiveData) {
+                    if ($entry -and $entry.dateStr) {
+                        $key = $entry.dateStr.Trim()
+                        # If existing entry is user-imported and incoming is inferred, keep existing
+                        if ($dateMap.Contains($key)) {
+                            $serverEntry = $dateMap[$key]
+                            if ($serverEntry.isUserImported -and -not $entry.isUserImported) {
+                                continue
+                            }
+                        }
+                        $dateMap[$key] = $entry
+                    }
+                }
+
+                $mergedList = @($dateMap.Values)
+                $updatedJsonStr = $mergedList | ConvertTo-Json -Depth 15 -Compress
+
+                $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+                $tmpJson = $hmisMasterJsonPath + ".tmp"
+                [System.IO.File]::WriteAllText($tmpJson, $updatedJsonStr, $utf8NoBom)
+                [System.IO.File]::Copy($tmpJson, $hmisMasterJsonPath, $true)
+                Remove-Item -Path $tmpJson -Force -ErrorAction SilentlyContinue
+
+                $jsContent = "const AVH_HMIS_MASTER_ARCHIVE = " + $updatedJsonStr + ";"
+                $tmpJs = $hmisMasterJsPath + ".tmp"
+                [System.IO.File]::WriteAllText($tmpJs, $jsContent, $utf8NoBom)
+                [System.IO.File]::Copy($tmpJs, $hmisMasterJsPath, $true)
+                Remove-Item -Path $tmpJs -Force -ErrorAction SilentlyContinue
+
+                Send-JsonResponse $response 200 @{
+                    success    = $true
+                    status     = "success"
+                    message    = "Isolation Archive saved and merged successfully"
+                    totalDates = $mergedList.Count
+                }
+            } catch {
+                Send-ErrorResponse $response 500 $_.Exception.Message
+            }
+            continue
+        }
+
+        # Any unknown /api/* endpoint
+        if ($localPath.StartsWith('/api/')) {
+            Send-ErrorResponse $response 404 "API endpoint not found"
+            continue
+        }
+
+        # =====================================================================
+        # SECURE STATIC FILE SERVING
+        # =====================================================================
+        if ($localPath -eq '/') {
+            $localPath = '/index.html'
+        }
+
+        # Require authentication for both staff JavaScript data aliases
+        if ($relLower -eq "js\avh_staff_master_data.js" -or $relLower -eq "js\avh_staff_data.js" -or $localPath -eq "/js/avh_staff_master_data.js" -or $localPath -eq "/js/avh_staff_data.js") {
+            $session = Get-AuthenticatedSession $request
+            if ($null -eq $session) {
+                Send-ErrorResponse $response 401 "Authentication required to access staff data scripts"
+                continue
+            }
+        }
+
+        # Canonical path resolution & containment check
+        $cleanRelPath = $localPath.TrimStart('/').Replace('/', '\')
+        $requestedFilePath = Join-Path -Path $PSScriptRoot -ChildPath $cleanRelPath
+        $fullPath = [System.IO.Path]::GetFullPath($requestedFilePath)
+
+        # Enforce canonical path stays strictly inside $PSScriptRoot
+        $rootCanonical = [System.IO.Path]::GetFullPath($PSScriptRoot).TrimEnd('\') + '\'
+        $isInsideRoot = $fullPath.StartsWith($rootCanonical, [System.StringComparison]::OrdinalIgnoreCase)
+
+        # Strictly forbid sensitive folders and private files
+        $relLower = $cleanRelPath.ToLower()
+        $isForbiddenFolder = $relLower.StartsWith("server_data") -or `
+                             $relLower.StartsWith("scratch") -or `
+                             $relLower.StartsWith("backups") -or `
+                             $relLower.StartsWith(".git") -or `
+                             $relLower.StartsWith(".gemini") -or `
+                             $relLower.StartsWith(".vscode")
+
+        $ext = [System.IO.Path]::GetExtension($fullPath).ToLower()
+        $forbiddenExtensions = @('.xlsx', '.xls', '.ps1', '.py', '.json', '.tmp', '.log', '.bak', '.md', '.db', '.db-wal', '.db-shm', '.sqlite')
+        $isForbiddenExtension = $forbiddenExtensions.Contains($ext)
+
+        # Allowed static asset extensions (includes .pdf)
+        $allowedExtensions = @('.html', '.css', '.js', '.png', '.jpg', '.jpeg', '.svg', '.ico', '.woff', '.woff2', '.pdf')
+        $isAllowedExtension = $allowedExtensions.Contains($ext)
+
+        # Extra rule: Never serve confidential employee master data directly as a static file
+        $isForbiddenFile = ($relLower -eq "js\avh_staff_2026_master.json") -or `
+                           ($relLower -eq "js\hai_cases_master.json") -or `
+                           ($relLower -eq "avh staff 2026 (13).xlsx")
+
+        if ($isInsideRoot -and (-not $isForbiddenFolder) -and (-not $isForbiddenExtension) -and $isAllowedExtension -and (-not $isForbiddenFile) -and (Test-Path -Path $fullPath -PathType Leaf)) {
+            $bytes = [System.IO.File]::ReadAllBytes($fullPath)
+            switch ($ext) {
+                '.html'  { $response.ContentType = 'text/html; charset=utf-8' }
+                '.css'   { $response.ContentType = 'text/css; charset=utf-8' }
+                '.js'    { $response.ContentType = 'application/javascript; charset=utf-8' }
+                '.png'   { $response.ContentType = 'image/png' }
+                '.jpg'   { $response.ContentType = 'image/jpeg' }
+                '.jpeg'  { $response.ContentType = 'image/jpeg' }
+                '.svg'   { $response.ContentType = 'image/svg+xml' }
+                '.ico'   { $response.ContentType = 'image/x-icon' }
+                '.woff'  { $response.ContentType = 'font/woff' }
+                '.woff2' { $response.ContentType = 'font/woff2' }
+                '.pdf'   { $response.ContentType = 'application/pdf' }
+                default  { $response.ContentType = 'application/octet-stream' }
+            }
+            try {
+                $response.ContentLength64 = $bytes.Length
+                $response.OutputStream.Write($bytes, 0, $bytes.Length)
+                $response.OutputStream.Close()
+            } catch [System.Net.HttpListenerException], [System.IO.IOException], [System.ObjectDisposedException] {
+                try { $response.Abort() } catch {}
+            } catch {
+                try { $response.OutputStream.Close() } catch {}
+            }
+        } else {
+            $response.StatusCode = 404
+            $buffer = [System.Text.Encoding]::UTF8.GetBytes("404 Not Found")
+            try {
+                $response.ContentLength64 = $buffer.Length
+                $response.OutputStream.Write($buffer, 0, $buffer.Length)
+                $response.OutputStream.Close()
+            } catch [System.Net.HttpListenerException], [System.IO.IOException], [System.ObjectDisposedException] {
+                try { $response.Abort() } catch {}
+            } catch {
+                try { $response.OutputStream.Close() } catch {}
+            }
+        }
+    } catch [System.Net.HttpListenerException], [System.IO.IOException], [System.ObjectDisposedException] {
+        try { $response.Abort() } catch {}
+    } catch {
+        try {
+            Send-ErrorResponse $response 500 "Internal server error: $($_.Exception.Message)"
+        } catch {}
+    }
+}
+} catch {
+    Write-Warning " [RECOVERY] Outer listener loop caught exception: $($_.Exception.Message). Rebuilding in 1 second..."
+    Start-Sleep -Seconds 1
+}
+}

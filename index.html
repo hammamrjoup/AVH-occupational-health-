@@ -1,0 +1,112 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+  <title>STAFF OCCUPATIONAL HEALTH & VACCINATION | Augusta Victoria Hospital</title>
+  
+  <!-- Meta SEO & Description -->
+  <meta name="description" content="STAFF OCCUPATIONAL HEALTH & VACCINATION SYSTEM for Augusta Victoria Hospital (مستشفى الأوغستا فكتوريا (المُطلع)) and The Lutheran World Federation.">
+  
+  <!-- Google Fonts: Cairo & Inter for Hospital Document Typography (Non-blocking) -->
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Cairo:wght@600;700;800&family=Inter:wght@400;600;700;800&display=swap" media="print" onload="this.media='all'">
+  <noscript><link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Cairo:wght@600;700;800&family=Inter:wght@400;600;700;800&display=swap"></noscript>
+
+  <!-- Stylesheet -->
+  <link rel="stylesheet" href="css/styles.css?v=20261102_INJURY_ARCHIVE_V18">
+</head>
+<body>
+
+  <!-- PORTAL LAYOUT CONTAINER (LEFT SIDEBAR PORTAL) -->
+  <div class="portal-wrapper">
+    
+    <!-- MOBILE OVERLAY BACKDROP -->
+    <div class="sidebar-overlay" id="sidebarOverlay" onclick="toggleMobileSidebar(false)"></div>
+
+    <!-- LEFT SIDEBAR PORTAL MENU -->
+    <aside class="portal-sidebar no-print" id="portalSidebar">
+      <!-- Rendered dynamically by app.js -->
+    </aside>
+
+    <!-- RIGHT MAIN CONTENT AREA -->
+    <div class="portal-main">
+      <!-- TOP HEADER BAR -->
+      <header class="portal-topbar no-print" id="portalTopBar">
+        <!-- Rendered dynamically by app.js -->
+      </header>
+
+      <!-- DYNAMIC CONTENT MAIN APP AREA -->
+      <main class="portal-content" id="mainAppArea">
+        <!-- Rendered dynamically by active view module -->
+      </main>
+
+      <!-- FOOTER -->
+      <footer class="portal-footer no-print">
+        <div class="portal-footer-content">
+          <div>
+            <strong>Augusta Victoria Hospital (مستشفى الأوغستا فكتوريا (المُطلع))</strong> - STAFF OCCUPATIONAL HEALTH & VACCINATION SYSTEM
+          </div>
+          <div>
+            © 2026 The Lutheran World Federation | ISO 9001:2015 Certified System
+          </div>
+        </div>
+      </footer>
+    </div>
+  </div>
+
+  <!-- SCRIPT INCLUSIONS (IN DEPENDENCY ORDER WITH CACHE BUSTERS AND DEFER) -->
+  <!-- Heavy analytics and Excel libraries deferred to allow instant initial DOM render -->
+  <script src="js/chart.umd.min.js?v=20261024_STANDALONE_V1" defer></script>
+  <script src="js/xlsx.full.min.js?v=20261024_STANDALONE_V1" defer></script>
+  <script src="js/i18n.js?v=20261108_AUDIT_OPT_V1" defer></script>
+  <script src="js/googleSheetsSync.js?v=20261024_STANDALONE_V1" defer></script>
+  <script src="js/githubSync.js?v=20261024_STANDALONE_V1" defer></script>
+  <script src="js/vaccinationService.js?v=20261024_STANDALONE_V1" defer></script>
+  <script src="js/data.js?v=20261108_AUDIT_OPT_V1" defer></script>
+  <script src="js/auth.js?v=20261108_LOGIN_FIRST_V1" defer></script>
+  <script src="js/reports.js?v=20261029_HBSAB_RENAMED_V1" charset="UTF-8" defer></script>
+  <script src="js/followupCalendar.js?v=20261110_RESPONSIVE_FIX_V57" charset="UTF-8" defer></script>
+  <script src="js/dashboard.js?v=20261103_DATALABELS_SMART_POS_V30" charset="UTF-8" defer></script>
+  <script src="js/injuryResponseTimeReport.js?v=20261104_STAFF_CALC_V49" charset="UTF-8" defer></script>
+  <script src="js/vaccinationForm.js?v=20261101_STAY_ON_PAGE_V8" defer></script>
+  <script src="js/injuryForm.js?v=20261101_STAY_ON_PAGE_V8" defer></script>
+  <script src="js/certificate.js?v=20261101_STAY_ON_PAGE_V8" defer></script>
+  <script src="js/dropdownManager.js?v=20261104_NEW_VACCINES_V13" defer></script>
+  <script src="js/systemManagement.js?v=20261024_STANDALONE_V12" defer></script>
+  <script src="js/staffEntryForm.js?v=20261102_INJURY_ARCHIVE_V18" defer></script>
+  <script src="js/app.js?v=20261108_PORTAL_PIC_ONLY_V1" defer></script>
+
+  <!-- Guided Fallback Helper for Direct file:// or Unextracted Previews -->
+  <script>
+    window.addEventListener('DOMContentLoaded', function() {
+      if (window.location && window.location.protocol === 'file:') {
+        var warn = document.createElement('div');
+        warn.style.cssText = "position:fixed;top:0;left:0;right:0;bottom:0;background:#f8fafc;display:flex;align-items:center;justify-content:center;font-family:system-ui,-apple-system,'Segoe UI',Roboto,sans-serif;z-index:999999;padding:20px;";
+        warn.innerHTML = '<div style="background:white;padding:36px;border-radius:14px;box-shadow:0 10px 30px rgba(0,0,0,0.12);max-width:560px;width:100%;text-align:center;border-top:6px solid #008080;">' +
+          '<div style="font-size:48px;margin-bottom:12px;">🏥</div>' +
+          '<h2 style="color:#0f172a;margin:0 0 10px;font-size:20px;font-weight:700;">Augusta Victoria Hospital — Occupational Health</h2>' +
+          '<p style="color:#64748b;font-size:14px;margin:0 0 20px;">مستشفى الأوغستا فكتوريا (المُطلع) — برنامج صحة العاملين والتطعيمات المهنية</p>' +
+          '<div style="background:#fef2f2;border:1px solid #fecaca;color:#991b1b;padding:16px;border-radius:10px;font-size:14px;line-height:1.6;margin-bottom:20px;text-align:left;">' +
+          '<strong>⚠️ How to Launch the Application:</strong><br>' +
+          'This standalone system runs with a secure native SQLite central database.<br><br>' +
+          '<ol style="margin:0 0 0 18px;padding:0;">' +
+          '<li>If viewing inside a ZIP, right-click the ZIP file and select <strong>"Extract All..."</strong>.</li>' +
+          '<li>Open the extracted folder and double-click <strong>start_server.bat</strong>.</li>' +
+          '<li>The server will start and automatically launch <strong>http://localhost:8085/</strong> in your browser.</li>' +
+          '</ol>' +
+          '</div>' +
+          '<div style="background:#f0fdf4;border:1px solid #bbf7d0;color:#166534;padding:14px;border-radius:10px;font-size:13px;line-height:1.6;direction:rtl;text-align:right;">' +
+          '<strong>طريقة تشغيل البرنامج:</strong><br>' +
+          '١. يرجى فك ضغط الأرشيف كاملاً بالنقر بزر الفأرة الأيمن واختيار <strong>Extract All</strong>.<br>' +
+          '٢. افتح المجلد المستخرج وانقر نقراً مزدوجاً على الملف: <strong>start_server.bat</strong>.<br>' +
+          '٣. سيفتح المتصفح تلقائياً على <code>http://localhost:8085/</code> ويعمل النظام بالكامل.' +
+          '</div>' +
+          '</div>';
+        document.body.appendChild(warn);
+      }
+    });
+  </script>
+</body>
+</html>
